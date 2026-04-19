@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 
-from pc_stat_win.categories import CATEGORY_LABELS_RU, NEUTRAL, PRODUCTIVE, UNPRODUCTIVE
+from pc_stat_win.categories import ALL_CATEGORY_KEYS, CATEGORY_LABELS_RU
 from pc_stat_win.db import Database
 from pc_stat_win.exe_metadata import friendly_app_name
 from pc_stat_win.formatting import format_duration_ms
@@ -41,6 +41,6 @@ def export_apps_csv(db: Database, q_from: float, q_to: float, file_path: str) ->
         w.writerow([])
         w.writerow(["# Суммы по категориям (по приложениям в фокусе)"])
         w.writerow(["category_key", "active_ms", "active_human"])
-        for key in (PRODUCTIVE, UNPRODUCTIVE, NEUTRAL):
+        for key in ALL_CATEGORY_KEYS:
             ms = by_cat.get(key, 0.0)
             w.writerow([key, int(round(ms)), format_duration_ms(ms)])
