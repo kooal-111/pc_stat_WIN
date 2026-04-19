@@ -1,11 +1,12 @@
 # Устанавливает ТОЛЬКО для этого репозитория user.name и user.email (GitHub noreply),
 # чтобы глобальный git config с личной почтой не попадал в коммиты.
-# Запуск из корня репозитория: .\scripts\setup_git_identity.ps1
-# Свой логин GitHub: -GitHubLogin "you" или свой адрес: -NoReplyEmail "id+you@users.noreply.github.com"
+# Запуск из корня репозитория:
+#   .\scripts\setup_git_identity.ps1 -GitHubLogin "your_github_username"
+# Либо сразу адрес из GitHub (Settings → Emails): -NoReplyEmail "id+login@users.noreply.github.com"
 
 param(
     [string]$UserName = "PC Stat",
-    [string]$GitHubLogin = "kooal-111",
+    [string]$GitHubLogin = "",
     [string]$NoReplyEmail = ""
 )
 
@@ -19,9 +20,11 @@ if (-not (Test-Path (Join-Path $root ".git"))) {
 
 if ($NoReplyEmail) {
     $email = $NoReplyEmail
-} else {
+} elseif ($GitHubLogin) {
     $u = Invoke-RestMethod -Uri "https://api.github.com/users/$GitHubLogin" -Headers @{ "User-Agent" = "pc_stat_WIN-setup" }
     $email = "$($u.id)+$GitHubLogin@users.noreply.github.com"
+} else {
+    Write-Error "Укажите -GitHubLogin `"<логин_GitHub>`" или полный -NoReplyEmail (см. комментарии в начале скрипта)."
 }
 
 git config --local user.name $UserName
