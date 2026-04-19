@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
+from pc_stat_win import autostart
 from pc_stat_win.branding import app_icon
 from pc_stat_win.collector import UsageCollector
 from pc_stat_win.config import POLL_INTERVAL_MS, ensure_app_dirs
@@ -17,14 +18,20 @@ from pc_stat_win.ui.main_window import MainWindow
 from pc_stat_win.ui.styles import load_stylesheet
 
 
+def _argv_without_background_flag() -> list[str]:
+    return [a for a in sys.argv if a != "--background"]
+
+
 def main() -> int:
     ensure_app_dirs()
-    app = QApplication(sys.argv)
+    start_to_tray_only = "--background" in sys.argv
+    app = QApplication(_argv_without_background_flag())
     app.setApplicationName("PC Stat")
     app.setQuitOnLastWindowClosed(False)
 
     db_path = ensure_app_dirs()
     db = Database(db_path)
+    autostart.refresh_registry_if_stale(db.get_autostart_enabled())
     theme = db.get_setting("ui_theme", "dark") or "dark"
     if theme not in ("dark", "light"):
         theme = "dark"
@@ -76,7 +83,6 @@ def main() -> int:
     act_quit.triggered.connect(on_quit)
     menu.addAction(act_quit)
     tray.setContextMenu(menu)
-    tray.showMessage("PC Stat", "Трекер запущен в фоне.", QSystemTrayIcon.MessageIcon.Information, 3000)
 
     def tray_activated(reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -86,7 +92,15 @@ def main() -> int:
 
     tray.activated.connect(tray_activated)
 
-    win.show()
+    show_window = (not start_to_tray_only) and db.get_show_main_window_on_launch()
+    if show_window:
+        win.show()
+        tray.showMessage(
+            "PC Stat",
+            "Трекер запущен в фоне.",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000,
+        )
     code = app.exec()
     return int(code)
 

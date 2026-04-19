@@ -16,7 +16,7 @@ from pc_stat_win.categories import (
     resolve_default_category,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _overlap_ms(start_ts: float, end_ts: float, duration_ms: int, q_from: float, q_to: float) -> float:
@@ -141,6 +141,13 @@ class Database:
 
     def set_autostart_enabled(self, enabled: bool) -> None:
         self.set_setting("autostart_enabled", "1" if enabled else "0")
+
+    def get_show_main_window_on_launch(self) -> bool:
+        """Показывать главное окно при обычном запуске (не через --background / автозагрузку)."""
+        return (self.get_setting("show_main_window_on_launch", "1") or "1") == "1"
+
+    def set_show_main_window_on_launch(self, show: bool) -> None:
+        self.set_setting("show_main_window_on_launch", "1" if show else "0")
 
     # --- intervals ---
     def insert_interval(
@@ -304,6 +311,11 @@ class Database:
                 """
             )
             self.set_setting("schema_version", "3")
+            ver = 3
+        if ver < 4:
+            if self.get_setting("show_main_window_on_launch") is None:
+                self.set_setting("show_main_window_on_launch", "1")
+            self.set_setting("schema_version", "4")
 
     # --- app categories ---
     def list_category_rules(self) -> list[sqlite3.Row]:
