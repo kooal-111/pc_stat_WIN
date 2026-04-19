@@ -32,8 +32,9 @@
 
 ## Установка
 
+Откройте папку с проектом в терминале (после `git clone` перейдите в неё: `cd pc_stat_WIN`).
+
 ```powershell
-cd C:\Code\python\pc_stat_WIN
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -43,6 +44,10 @@ pip install -r requirements.txt
 
 ## Запуск
 
+**Проще всего:** дважды щёлкните **`PC Stat.bat`** в корне проекта (используется виртуальное окружение `.venv`, если оно есть, иначе `python` / `py -3` из системы).
+
+Или из терминала:
+
 ```powershell
 python -m pc_stat_win
 ```
@@ -51,18 +56,25 @@ python -m pc_stat_win
 
 ## Как отдать программу другим (без Python)
 
-Соберите **папку с готовым `.exe`** через [PyInstaller](https://pyinstaller.org/):
+Соберите через [PyInstaller](https://pyinstaller.org/) из корня проекта:
 
 ```powershell
-cd C:\Code\python\pc_stat_WIN
 .\scripts\build_windows.ps1
 ```
 
-После сборки запуск: `dist\PCStat\PCStat.exe`. **Раздавайте всю папку `dist\PCStat`** (внутри лежат DLL и Qt) — можно заархивировать её в **ZIP** и выложить на облако или в [релизы GitHub](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) (прикрепить ZIP как asset).
+Получится папка **`dist\PCStat\`** — запуск: `PCStat.exe` внутри неё. **Отдавайте всю папку** (или ZIP целиком): рядом лежат DLL и Qt.
 
-Вариант для разработчиков: выложить репозиторий и в README указать установку из `requirements.txt` и команду `python -m pc_stat_win`.
+**Один файл для пользователей** (проще переслать, но первый запуск чуть дольше):
 
-**Git:** папки **`build/`** и **`dist/`** не включайте в репозиторий — PyInstaller записывает туда абсолютные пути с вашего компьютера (в т.ч. имя пользователя Windows). Они перечислены в `.gitignore`. Перед пушем при необходимости удалите их локально: `.\scripts\clean_build.ps1`.
+```powershell
+.\scripts\build_windows.ps1 -OneFile
+```
+
+Результат: **`dist\PCStat.exe`** — одно приложение, без папки.
+
+Вариант для разработчиков: выложить репозиторий; пользователи с Python ставят зависимости и запускают **`PC Stat.bat`** или `python -m pc_stat_win`.
+
+**Git:** не коммитьте **`build/`** и **`dist/`** — в артефактах сборки бывают абсолютные пути с вашего ПК. Они в `.gitignore`. Локально очистка: `.\scripts\clean_build.ps1`.
 
 ## Настройки
 
