@@ -21,18 +21,22 @@ def launch_command() -> str:
     return f'"{Path(sys.executable).resolve()}" -m pc_stat_win --background'
 
 
-def refresh_registry_if_stale(autostart_should_be_on: bool) -> None:
-    """Обновить запись Run, если автозагрузка включена в БД, но в реестре ещё старая строка без --background."""
+def sync_run_key_if_autostart(autostart_should_be_on: bool) -> bool:
+    """Если автозагрузка включена — всегда перезаписать HKCU\\...\\Run актуальной командой (путь к exe и --background).
+
+    Возвращает True, если до записи в реестре не было `--background` (тот же запуск ещё без флага в argv).
+    """
     if not autostart_should_be_on:
-        return
+        return False
+    was_stale = True
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_READ) as k:
             val, _ = winreg.QueryValueEx(k, _APP_VALUE_NAME)
+        was_stale = "--background" not in str(val).lower()
     except OSError:
-        return
-    if "--background" in str(val):
-        return
+        was_stale = True
     set_enabled(True)
+    return was_stale
 
 
 def is_enabled() -> bool:

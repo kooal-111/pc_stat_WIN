@@ -22,16 +22,28 @@ def _argv_without_background_flag() -> list[str]:
     return [a for a in sys.argv if a != "--background"]
 
 
+def _seconds_since_boot() -> float:
+    try:
+        return max(0.0, time.time() - float(psutil.boot_time()))
+    except Exception:
+        return 1e9
+
+
 def main() -> int:
     ensure_app_dirs()
-    start_to_tray_only = "--background" in sys.argv
+    db_path = ensure_app_dirs()
+    db = Database(db_path)
+    registry_was_stale = autostart.sync_run_key_if_autostart(db.get_autostart_enabled())
+    # Первый запуск после обновления: в реестре ещё старая строка без --background — Windows не передаёт флаг.
+    # Скрываем окно только вскоре после загрузки ОС, чтобы не спрятать окно при ручном запуске позже.
+    fresh_boot_session = _seconds_since_boot() < 300.0
+    start_to_tray_only = ("--background" in sys.argv) or (
+        registry_was_stale and fresh_boot_session and db.get_autostart_enabled()
+    )
+
     app = QApplication(_argv_without_background_flag())
     app.setApplicationName("PC Stat")
     app.setQuitOnLastWindowClosed(False)
-
-    db_path = ensure_app_dirs()
-    db = Database(db_path)
-    autostart.refresh_registry_if_stale(db.get_autostart_enabled())
     theme = db.get_setting("ui_theme", "dark") or "dark"
     if theme not in ("dark", "light"):
         theme = "dark"
