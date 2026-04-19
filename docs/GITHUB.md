@@ -56,9 +56,11 @@ git push origin main
 
 Результат: `installer\output\PCStat-Setup.exe`.
 
-Бинарники **не** кладутся в git — только выкладываются как вложения релиза (см. ниже).
+**Копия для пользователей в репозитории:** после onefile-сборки выполните `.\scripts\sync_download_exe.ps1` — в папку **`download/`** попадёт актуальный `PCStat.exe`, его и коммитят (см. README). Каталоги **`build/`** и **`dist/`** по-прежнему в `.gitignore`.
 
-## GitHub Releases: отдать пользователям один .exe
+## GitHub Releases (по желанию)
+
+Дополнительно к папке `download/` можно выкладывать тот же файл как вложение релиза.
 
 1. Соберите `dist\PCStat.exe` или `installer\output\PCStat-Setup.exe`.
 2. Установите [GitHub CLI](https://cli.github.com/) и выполните `gh auth login`.
@@ -72,7 +74,7 @@ git push origin main
 
 **Вручную:** на сайте GitHub → репозиторий → **Releases** → **Draft a new release** → тег `v1.0.0` → прикрепите файл в **Attach binaries** → **Publish release**.
 
-Ссылка «последняя версия» для README:
+Ссылка «последняя версия»:
 
 `https://github.com/kooal-111/pc_stat_WIN/releases/latest`
 
