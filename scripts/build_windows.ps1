@@ -10,6 +10,8 @@ Set-Location (Join-Path $PSScriptRoot "..")
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt pyinstaller
 
+python -c "from pc_stat_win.branding import write_packaged_icon_assets; p=write_packaged_icon_assets(); print('Icons:', p[0], p[1])"
+
 if ($OneFile) {
     python -m PyInstaller pc_stat_win_onefile.spec --noconfirm
     Write-Host ""

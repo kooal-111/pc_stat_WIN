@@ -32,7 +32,6 @@ class UsageCollector(QObject):
         self._app_duration_ms = 0
         self._app_start_ts = 0.0
         self._app_key: tuple[str, str] | None = None
-        self._app_title = ""
 
         boot = float(psutil.boot_time())
         self._db.log_boot_if_new(boot)
@@ -107,7 +106,6 @@ class UsageCollector(QObject):
             self._app_key = key
             self._app_start_ts = now - di / 1000.0
             self._app_duration_ms = di
-            self._app_title = title
             self._app_row_id = self._db.insert_interval(
                 "app",
                 exe_path=fg.exe_path,
@@ -119,7 +117,6 @@ class UsageCollector(QObject):
             )
         else:
             self._app_duration_ms += di
-            self._app_title = title
             self._db.update_interval(self._app_row_id, now, self._app_duration_ms)
             if title:
                 self._db.update_window_title(self._app_row_id, title)

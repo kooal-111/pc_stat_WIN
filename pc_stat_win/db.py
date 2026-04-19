@@ -7,18 +7,16 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
 from pc_stat_win.categories import (
-    NEUTRAL,
-    PRODUCTIVE,
-    UNPRODUCTIVE,
-    default_category_for_basename,
+    ALL_CATEGORY_KEYS,
+    normalize_legacy_category,
+    resolve_default_category,
 )
 
-
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _overlap_ms(start_ts: float, end_ts: float, duration_ms: int, q_from: float, q_to: float) -> float:
@@ -36,6 +34,7 @@ class AppStat:
     exe_name: str
     exe_path: str
     active_ms: float
+    window_title: str | None = None
 
 
 class Database:
@@ -137,6 +136,12 @@ class Database:
     def set_afk_seconds(self, sec: float) -> None:
         self.set_setting("afk_seconds", str(max(5.0, sec)))
 
+    def get_autostart_enabled(self) -> bool:
+        return (self.get_setting("autostart_enabled", "1") or "1") == "1"
+
+    def set_autostart_enabled(self, enabled: bool) -> None:
+        self.set_setting("autostart_enabled", "1" if enabled else "0")
+
     # --- intervals ---
     def insert_interval(
         self,
@@ -198,7 +203,21 @@ class Database:
             )
         return total
 
+    def estimated_pc_uptime_seconds(self, q_from: float, q_to: float) -> float:
+        """Сумма длин пересечений сессий [boot_i, boot_{i+1}) с [q_from, q_to]; последняя сессия до now."""
+        rows = self._conn.execute("SELECT boot_ts FROM boot_log ORDER BY boot_ts ASC").fetchall()
+        if not rows:
+            return max(0.0, q_to - q_from)
+        boots = [float(r[0]) for r in rows]
+        now = time.time()
+        total = 0.0
+        for i, start in enumerate(boots):
+            end = boots[i + 1] if i + 1 < len(boots) else now
+            total += max(0.0, min(end, q_to) - max(start, q_from))
+        return total
+
     def totals_by_app(self, q_from: float, q_to: float) -> list[AppStat]:
+        """Суммарное время по приложению: одна строка на exe (окно в фокусе)."""
         acc: dict[tuple[str, str], float] = {}
         for row in self._conn.execute(
             "SELECT exe_path, exe_name, start_ts, end_ts, duration_ms FROM intervals WHERE kind = 'app'"
@@ -256,6 +275,35 @@ class Database:
                 """
             )
             self.set_setting("schema_version", "2")
+            ver = 2
+        if ver < 3:
+            self._conn.executescript(
+                """
+                CREATE TABLE app_category_rules_new (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  match_text TEXT NOT NULL,
+                  match_kind TEXT NOT NULL CHECK (match_kind IN ('exact_basename', 'path_contains')),
+                  category TEXT NOT NULL CHECK (category IN (
+                    'work','distraction','communication','games','media','devtools','system','other'
+                  )),
+                  priority INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO app_category_rules_new (id, match_text, match_kind, category, priority)
+                SELECT id, match_text, match_kind,
+                  CASE category
+                    WHEN 'productive' THEN 'work'
+                    WHEN 'unproductive' THEN 'distraction'
+                    WHEN 'neutral' THEN 'other'
+                    ELSE category
+                  END,
+                  priority
+                FROM app_category_rules;
+                DROP TABLE app_category_rules;
+                ALTER TABLE app_category_rules_new RENAME TO app_category_rules;
+                CREATE INDEX IF NOT EXISTS idx_app_cat_rules_prio ON app_category_rules (priority DESC, id DESC);
+                """
+            )
+            self.set_setting("schema_version", "3")
 
     # --- app categories ---
     def list_category_rules(self) -> list[sqlite3.Row]:
@@ -297,16 +345,18 @@ class Database:
             if not mt:
                 continue
             if r["match_kind"] == "exact_basename" and base == mt:
-                return str(r["category"])
+                return normalize_legacy_category(str(r["category"]))
             if r["match_kind"] == "path_contains" and mt in path_lower:
-                return str(r["category"])
-        return default_category_for_basename(base)
+                return normalize_legacy_category(str(r["category"]))
+        return resolve_default_category(exe_path)
 
     def totals_by_category(self, q_from: float, q_to: float) -> dict[str, float]:
-        acc = {PRODUCTIVE: 0.0, UNPRODUCTIVE: 0.0, NEUTRAL: 0.0}
+        acc = {k: 0.0 for k in ALL_CATEGORY_KEYS}
         for a in self.totals_by_app(q_from, q_to):
             cat = self.resolve_category(a.exe_path)
-            acc[cat] = acc.get(cat, 0.0) + a.active_ms
+            if cat not in acc:
+                acc[cat] = 0.0
+            acc[cat] += a.active_ms
         return acc
 
     def bucket_pc_active_by_calendar_day(self, q_from: float, q_to: float) -> list[tuple[str, float]]:
@@ -317,7 +367,7 @@ class Database:
         out: list[tuple[str, float]] = []
         d = d0
         while d <= d1:
-            day_start = datetime.combine(d, time(0, 0), tzinfo=tz)
+            day_start = datetime.combine(d, dt_time(0, 0), tzinfo=tz)
             day_end = day_start + timedelta(days=1)
             ts0 = day_start.timestamp()
             ts1 = day_end.timestamp()

@@ -14,6 +14,9 @@ __pycache__/
 # PyInstaller — не коммитить: внутри абсолютные пути к Python на вашем ПК (имя пользователя и т.д.)
 build/
 dist/
+
+# Inno Setup (артефакт установщика)
+installer/output/
 *.spec.bak
 
 # IDE / OS

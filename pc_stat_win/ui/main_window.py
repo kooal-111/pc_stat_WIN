@@ -9,6 +9,7 @@ from PySide6.QtGui import QCloseEvent, QFont, QFontMetrics, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from pc_stat_win import autostart
 from pc_stat_win.categories import CATEGORY_LABELS_RU
 from pc_stat_win.collector import UsageCollector
 from pc_stat_win.db import Database
@@ -80,6 +82,7 @@ class MainWindow(QMainWindow):
         self._period.setPlaceholderText("выберите пресет справа")
         top.addWidget(self._period, stretch=1)
 
+        self._period_buttons: dict[Period, QPushButton] = {}
         period_buttons: list[tuple[str, Period, str]] = [
             ("Сегодня", "today", "periodToday"),
             ("Неделя", "week", "periodWeek"),
@@ -92,6 +95,7 @@ class MainWindow(QMainWindow):
             b.setObjectName(oid)
             b.setAutoDefault(False)
             b.clicked.connect(partial(self._set_period, key))
+            self._period_buttons[key] = b
             top.addWidget(b)
 
         self._btn_export = QPushButton("Экспорт CSV…")
@@ -210,6 +214,11 @@ class MainWindow(QMainWindow):
         self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         form_set.addRow("Тема оформления:", self._theme_combo)
 
+        self._autostart_cb = QCheckBox("Запускать вместе с Windows")
+        self._autostart_cb.setChecked(self._db.get_autostart_enabled())
+        self._autostart_cb.toggled.connect(self._save_autostart)
+        form_set.addRow(self._autostart_cb)
+
         self._afk = QDoubleSpinBox()
         self._afk.setRange(5.0, 3600.0)
         self._afk.setSingleStep(10.0)
@@ -227,8 +236,8 @@ class MainWindow(QMainWindow):
         form_set.addRow(ex)
 
         hint = QLabel(
-            "Учитывается только активное окно (foreground). "
-            "Время без ввода дольше порога не идёт в «активное» ни для ПК, ни для приложений.\n"
+            "Учитывается только активное окно (foreground): при отсутствии ввода дольше порога AFK "
+            "время не идёт ни для ПК, ни для приложения. Пока ПК выключен, данные не пишутся.\n"
             f"База данных: {self._db.path}"
         )
         hint.setWordWrap(True)
@@ -238,6 +247,7 @@ class MainWindow(QMainWindow):
 
         self._current_period: Period = "week"
         self._apply_period_label()
+        self._sync_period_buttons()
         self._refresh_rules_table()
         th_key = th if th in ("dark", "light") else "dark"
         self._reports.apply_chart_theme(th_key)
@@ -286,6 +296,18 @@ class MainWindow(QMainWindow):
         self.refresh_stats()
 
     @Slot()
+    def _save_autostart(self) -> None:
+        en = self._autostart_cb.isChecked()
+        self._db.set_autostart_enabled(en)
+        autostart.set_enabled(en)
+
+    def _sync_period_buttons(self) -> None:
+        for key, btn in self._period_buttons.items():
+            btn.setProperty("selected", key == self._current_period)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    @Slot()
     def _on_theme_changed(self) -> None:
         name = self._theme_combo.currentData()
         if not name:
@@ -309,6 +331,7 @@ class MainWindow(QMainWindow):
     def _set_period(self, p: Period) -> None:
         self._current_period = p
         self._apply_period_label()
+        self._sync_period_buttons()
         self.refresh_stats()
 
     def _apply_period_label(self) -> None:
@@ -365,22 +388,28 @@ class MainWindow(QMainWindow):
         session_uptime = max(0.0, time.time() - boot)
 
         wall_sec = max(0.0, q_to - q_from)
+        pc_uptime_sec = self._db.estimated_pc_uptime_seconds(q_from, q_to)
+        denom_sec = pc_uptime_sec if pc_uptime_sec > 0 else wall_sec
+        denom_desc = (
+            "оценённого времени работы ПК в периоде (по журналу загрузок; режим сна не вычитается)"
+        )
+
         share_pct = 0.0
-        if wall_sec > 0 and pc_ms > 0:
-            share_pct = min(100.0, 100.0 * (pc_ms / 1000.0) / wall_sec)
+        if denom_sec > 0 and pc_ms > 0:
+            share_pct = min(100.0, 100.0 * (pc_ms / 1000.0) / denom_sec)
 
         self._summary.setText(
             f"Время с загрузки Windows (сейчас): {format_duration_seconds(session_uptime)}.\n"
             f"Активное время за выбранный период (есть ввод мыши/клавиатуры, без AFK): "
             f"{format_duration_ms(pc_ms)}.\n"
-            f"Окно в фокусе без ввода не считается активным использованием."
+            f"Пока ПК выключен, трекер не работает — интервалы не пишутся."
         )
 
         self._period_stats.setText(
-            f"Длительность выбранного периода: {format_duration_seconds(wall_sec)}. "
+            f"Календарная длина периода: {format_duration_seconds(wall_sec)}; "
+            f"оценка времени работы ПК в этом интервале: {format_duration_seconds(pc_uptime_sec)}. "
             f"Приложений в таблице: {len(apps)}. "
-            f"Доля активного времени от длины периода: {share_pct:.1f}% "
-            f"(отношение суммарного активного времени к длительности периода)."
+            f"Доля активного времени от {denom_desc}: {share_pct:.1f}%."
         )
 
         for i in range(5):
@@ -388,7 +417,7 @@ class MainWindow(QMainWindow):
             if i < len(apps) and pc_ms > 0:
                 a = apps[i]
                 disp = friendly_app_name(a.exe_path)
-                name_lbl.setText(disp[:48] + ("…" if len(disp) > 48 else ""))
+                name_lbl.setText(disp[:56] + ("…" if len(disp) > 56 else ""))
                 pct = min(100, int(round(100.0 * a.active_ms / pc_ms)))
                 bar.setValue(pct)
                 bar.setFormat(f"{format_duration_ms(a.active_ms)}  ({pct}% от активного времени ПК)")

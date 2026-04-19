@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor, QPainter
-from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QLabel, QScrollArea, QVBoxLayout, QWidget
 
-from pc_stat_win.categories import CATEGORY_LABELS_RU, NEUTRAL, PRODUCTIVE, UNPRODUCTIVE
+from pc_stat_win.categories import ALL_CATEGORY_KEYS, CATEGORY_LABELS_RU
 from pc_stat_win.db import Database
 from pc_stat_win.formatting import format_duration_ms
 
@@ -28,7 +28,13 @@ class ReportsTab(QWidget):
     def __init__(self, db: Database) -> None:
         super().__init__()
         self._db = db
-        layout = QVBoxLayout(self)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
         self._summary = QLabel()
         self._summary.setObjectName("reportsSummary")
         self._summary.setWordWrap(True)
@@ -52,6 +58,11 @@ class ReportsTab(QWidget):
             layout.addWidget(
                 QLabel("QtCharts недоступен — установите полный PySide6 с модулем QtCharts.")
             )
+
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
     def apply_chart_theme(self, theme_key: str) -> None:
         """Согласовать фон графиков с QSS (светлая/тёмная тема)."""
@@ -81,8 +92,10 @@ class ReportsTab(QWidget):
             "",
             "По категориям (по приложениям в фокусе):",
         ]
-        for key in (PRODUCTIVE, UNPRODUCTIVE, NEUTRAL):
+        for key in ALL_CATEGORY_KEYS:
             ms = by_cat.get(key, 0.0)
+            if ms < 0.5:
+                continue
             label = CATEGORY_LABELS_RU.get(key, key)
             pct = 100.0 * ms / pc_ms if pc_ms > 0 else 0.0
             lines.append(f"  • {label}: {format_duration_ms(ms)} ({pct:.1f}%)")
@@ -99,7 +112,7 @@ class ReportsTab(QWidget):
 
         self._chart_pie.removeAllSeries()
         pie = QPieSeries()
-        for key in (PRODUCTIVE, UNPRODUCTIVE, NEUTRAL):
+        for key in ALL_CATEGORY_KEYS:
             ms = by_cat.get(key, 0.0)
             if ms > 0.5:
                 pie.append(CATEGORY_LABELS_RU.get(key, key), ms)

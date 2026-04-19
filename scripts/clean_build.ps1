@@ -3,7 +3,7 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
-foreach ($d in @("build", "dist")) {
+foreach ($d in @("build", "dist", "installer\output")) {
     $p = Join-Path (Get-Location) $d
     if (Test-Path $p) {
         Remove-Item -Recurse -Force $p

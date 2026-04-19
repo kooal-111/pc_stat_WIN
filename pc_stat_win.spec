@@ -9,9 +9,13 @@ try:
 except NameError:  # старые версии PyInstaller
     _ROOT = Path(__file__).resolve().parent
 
+_assets = _ROOT / "pc_stat_win" / "assets"
+_icon = _assets / "app.ico"
+
 _datas = [
     (str(_ROOT / "pc_stat_win" / "ui" / "theme_dark.qss"), "pc_stat_win/ui"),
     (str(_ROOT / "pc_stat_win" / "ui" / "theme_light.qss"), "pc_stat_win/ui"),
+    (str(_assets), "pc_stat_win/assets"),
 ]
 
 block_cipher = None
@@ -56,6 +60,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(_icon),
 )
 
 coll = COLLECT(
