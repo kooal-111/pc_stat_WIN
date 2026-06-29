@@ -14,10 +14,13 @@ def _local_app_data() -> Path:
 APP_DIR_NAME = "pc_stat_win"
 DEFAULT_AFK_SECONDS = 120.0
 POLL_INTERVAL_MS = 2000
+MAX_TICK_INTERVAL_MS = 15000
+UI_REFRESH_INTERVAL_MS = 10000
 
 # Foreground exe basename — usually not focused for user work; still filter conservative
 SYSTEM32_SILENT_EXES = frozenset(
-    {
+    name.lower()
+    for name in {
         "svchost.exe",
         "dwm.exe",
         "csrss.exe",

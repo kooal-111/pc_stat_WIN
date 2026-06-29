@@ -1,11 +1,19 @@
 # Сборка PyInstaller onefile (dist\PCStat.exe), затем Inno Setup → installer\output\PCStat-Setup.exe
 # Требуется Inno Setup 6: https://jrsoftware.org/isinfo.php
 
+param(
+    [switch]$NoQtCharts
+)
+
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-& (Join-Path $PSScriptRoot "build_windows.ps1") -OneFile
+if ($NoQtCharts) {
+    & (Join-Path $PSScriptRoot "build_windows.ps1") -OneFile -NoQtCharts
+} else {
+    & (Join-Path $PSScriptRoot "build_windows.ps1") -OneFile
+}
 
 $exe = Join-Path $root "dist\PCStat.exe"
 if (-not (Test-Path -LiteralPath $exe)) {

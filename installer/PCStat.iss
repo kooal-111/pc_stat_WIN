@@ -2,7 +2,7 @@
 ; Запуск: ISCC.exe PCStat.iss из каталога installer (или через scripts\build_installer.ps1).
 
 #define MyAppName "PC Stat"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "PC Stat"
 #define MyAppExeName "PCStat.exe"
 ; Стабильный AppId — не менять между выпусками, чтобы «обновление» видело ту же программу.
@@ -16,7 +16,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
-OutputDir=output
+OutputDir=installer\output
 OutputBaseFilename=PCStat-Setup
 SourceDir=..
 Compression=lzma2

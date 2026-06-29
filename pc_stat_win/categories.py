@@ -11,6 +11,12 @@ GAMES = "games"
 MEDIA = "media"
 DEVTOOLS = "devtools"
 SYSTEM = "system"
+BROWSER = "browser"
+OFFICE_DOCS = "office_docs"
+CREATIVE = "creative"
+REMOTE_ACCESS = "remote_access"
+FILES = "files"
+AI_TOOLS = "ai_tools"
 OTHER = "other"
 
 _LEGACY_PRODUCTIVE = "productive"
@@ -25,6 +31,12 @@ ALL_CATEGORY_KEYS: Final[tuple[str, ...]] = (
     MEDIA,
     DEVTOOLS,
     SYSTEM,
+    BROWSER,
+    OFFICE_DOCS,
+    CREATIVE,
+    REMOTE_ACCESS,
+    FILES,
+    AI_TOOLS,
     OTHER,
 )
 
@@ -36,7 +48,30 @@ CATEGORY_LABELS_RU: dict[str, str] = {
     MEDIA: "Медиа / контент",
     DEVTOOLS: "Разработка / IDE",
     SYSTEM: "Система / утилиты",
+    BROWSER: "Браузер / веб",
+    OFFICE_DOCS: "Документы / офис",
+    CREATIVE: "Дизайн / креатив",
+    REMOTE_ACCESS: "Удалённый доступ",
+    FILES: "Файлы / архивы",
+    AI_TOOLS: "AI / ассистенты",
     OTHER: "Прочее / нейтрально",
+}
+
+CATEGORY_COLORS: dict[str, str] = {
+    WORK: "#3b82f6",
+    DISTRACTION: "#ef4444",
+    COMMUNICATION: "#06b6d4",
+    GAMES: "#a855f7",
+    MEDIA: "#f59e0b",
+    DEVTOOLS: "#10b981",
+    SYSTEM: "#64748b",
+    BROWSER: "#2563eb",
+    OFFICE_DOCS: "#14b8a6",
+    CREATIVE: "#ec4899",
+    REMOTE_ACCESS: "#8b5cf6",
+    FILES: "#84cc16",
+    AI_TOOLS: "#6366f1",
+    OTHER: "#94a3b8",
 }
 
 
@@ -52,9 +87,12 @@ _PATH_HINTS: list[tuple[str, str]] = [
     (r"steam\steamapps", GAMES),
     (r"epic games", GAMES),
     (r"riot games", GAMES),
-    (r"microsoft office", WORK),
-    (r"program files\google\chrome", OTHER),
-    (r"program files (x86)\google\chrome", OTHER),
+    (r"microsoft office", OFFICE_DOCS),
+    (r"program files\google\chrome", BROWSER),
+    (r"program files (x86)\google\chrome", BROWSER),
+    (r"yandex\yandexbrowser", BROWSER),
+    (r"adobe", CREATIVE),
+    (r"obs studio", CREATIVE),
 ]
 
 
@@ -72,20 +110,58 @@ _DEFAULT_BY_BASENAME: dict[str, str] = {
     "slack.exe": WORK,
     "teams.exe": WORK,
     "zoom.exe": COMMUNICATION,
-    "chrome.exe": OTHER,
-    "msedge.exe": OTHER,
-    "firefox.exe": OTHER,
+    "chrome.exe": BROWSER,
+    "msedge.exe": BROWSER,
+    "firefox.exe": BROWSER,
+    "brave.exe": BROWSER,
+    "opera.exe": BROWSER,
+    "opera_gx.exe": BROWSER,
+    "vivaldi.exe": BROWSER,
+    "browser.exe": BROWSER,
+    "yandexbrowser.exe": BROWSER,
     "steam.exe": GAMES,
     "epicgameslauncher.exe": GAMES,
+    "riotclientservices.exe": GAMES,
     "devenv.exe": DEVTOOLS,
     "code.exe": DEVTOOLS,
     "cursor.exe": DEVTOOLS,
     "pycharm64.exe": DEVTOOLS,
+    "webstorm64.exe": DEVTOOLS,
+    "idea64.exe": DEVTOOLS,
     "windowsterminal.exe": DEVTOOLS,
     "powershell.exe": DEVTOOLS,
     "cmd.exe": SYSTEM,
-    "notepad.exe": OTHER,
-    "explorer.exe": SYSTEM,
+    "winword.exe": OFFICE_DOCS,
+    "excel.exe": OFFICE_DOCS,
+    "powerpnt.exe": OFFICE_DOCS,
+    "onenote.exe": OFFICE_DOCS,
+    "acrord32.exe": OFFICE_DOCS,
+    "acrobat.exe": OFFICE_DOCS,
+    "sumatrapdf.exe": OFFICE_DOCS,
+    "notepad.exe": OFFICE_DOCS,
+    "notepad++.exe": OFFICE_DOCS,
+    "figma.exe": CREATIVE,
+    "photoshop.exe": CREATIVE,
+    "illustrator.exe": CREATIVE,
+    "blender.exe": CREATIVE,
+    "gimp.exe": CREATIVE,
+    "inkscape.exe": CREATIVE,
+    "resolve.exe": CREATIVE,
+    "obs64.exe": CREATIVE,
+    "mstsc.exe": REMOTE_ACCESS,
+    "anydesk.exe": REMOTE_ACCESS,
+    "teamviewer.exe": REMOTE_ACCESS,
+    "rustdesk.exe": REMOTE_ACCESS,
+    "parsecd.exe": REMOTE_ACCESS,
+    "explorer.exe": FILES,
+    "totalcmd.exe": FILES,
+    "totalcmd64.exe": FILES,
+    "7zfm.exe": FILES,
+    "winrar.exe": FILES,
+    "everything.exe": FILES,
+    "chatgpt.exe": AI_TOOLS,
+    "claude.exe": AI_TOOLS,
+    "copilot.exe": AI_TOOLS,
     "spotify.exe": MEDIA,
     "vlc.exe": MEDIA,
 }

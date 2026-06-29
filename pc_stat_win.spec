@@ -3,6 +3,7 @@
 # Результат: dist/PCStat/PCStat.exe (+ DLL и PySide6 рядом)
 
 from pathlib import Path
+import os
 
 try:
     _ROOT = Path(SPECPATH).resolve()
@@ -11,6 +12,7 @@ except NameError:  # старые версии PyInstaller
 
 _assets = _ROOT / "pc_stat_win" / "assets"
 _icon = _assets / "app.ico"
+_with_qtcharts = os.environ.get("PCSTAT_WITH_QTCHARTS", "1") != "0"
 
 _datas = [
     (str(_ROOT / "pc_stat_win" / "ui" / "theme_dark.qss"), "pc_stat_win/ui"),
@@ -30,8 +32,7 @@ a = Analysis(
         "win32api",
         "win32gui",
         "win32process",
-        "PySide6.QtCharts",
-    ],
+    ] + (["PySide6.QtCharts"] if _with_qtcharts else []),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -61,6 +62,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(_icon),
+    version=str(_ROOT / "pc_stat_win" / "version_info.txt"),
 )
 
 coll = COLLECT(

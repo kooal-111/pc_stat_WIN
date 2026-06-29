@@ -11,11 +11,13 @@ __pycache__/
 .eggs/
 *.egg
 
-# PyInstaller — не коммитить: внутри абсолютные пути к Python на вашем ПК (имя пользователя и т.д.)
+# PyInstaller / local build artifacts
 build/
 dist/
+output/
+PC Stat/
 
-# Inno Setup (артефакт установщика)
+# Inno Setup output
 installer/output/
 *.spec.bak
 

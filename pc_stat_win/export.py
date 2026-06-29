@@ -3,23 +3,26 @@ from __future__ import annotations
 import csv
 
 from pc_stat_win.categories import ALL_CATEGORY_KEYS, CATEGORY_LABELS_RU
-from pc_stat_win.db import Database
+from pc_stat_win.db import Database, PeriodStats
 from pc_stat_win.exe_metadata import friendly_app_name
 from pc_stat_win.formatting import format_duration_ms
 
 
-def export_apps_csv(db: Database, q_from: float, q_to: float, file_path: str) -> None:
+def export_apps_csv(
+    db: Database, q_from: float, q_to: float, file_path: str, stats: PeriodStats | None = None
+) -> None:
     """Write UTF-8 with BOM for Excel; semicolon separator."""
-    pc_ms = db.total_pc_ms(q_from, q_to)
-    apps = db.totals_by_app(q_from, q_to)
-    by_cat = db.totals_by_category(q_from, q_to)
+    stats = stats or db.period_stats(q_from, q_to)
+    pc_ms = stats.pc_ms
+    apps = stats.apps
+    by_cat = stats.by_category
     with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(
             ["friendly_name", "exe_path", "category", "active_ms", "active_human"]
         )
         for a in apps:
-            cat = db.resolve_category(a.exe_path)
+            cat = a.category or db.resolve_category(a.exe_path)
             w.writerow(
                 [
                     friendly_app_name(a.exe_path),

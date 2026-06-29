@@ -5,6 +5,7 @@ import time
 import psutil
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from pc_stat_win.config import MAX_TICK_INTERVAL_MS
 from pc_stat_win.db import Database
 from pc_stat_win.foreground import ForegroundInfo, get_foreground_app
 from pc_stat_win.idle import idle_seconds
@@ -32,6 +33,7 @@ class UsageCollector(QObject):
         self._app_duration_ms = 0
         self._app_start_ts = 0.0
         self._app_key: tuple[str, str] | None = None
+        self._app_window_title: str | None = None
 
         boot = float(psutil.boot_time())
         self._db.log_boot_if_new(boot)
@@ -47,6 +49,10 @@ class UsageCollector(QObject):
         now = time.time()
         dt_ms = max(0.0, (now - self._last_ts) * 1000)
         self._last_ts = now
+        if dt_ms > MAX_TICK_INTERVAL_MS:
+            self._clear_open_state()
+            self.tick_done.emit()
+            return
 
         idle_sec = idle_seconds()
         afk_after = self._db.get_afk_seconds()
@@ -63,9 +69,10 @@ class UsageCollector(QObject):
             self.tick_done.emit()
             return
 
-        self._extend_pc(now, di)
         fg = get_foreground_app()
-        self._extend_app(now, di, fg, extra_ex)
+        with self._db.transaction():
+            self._extend_pc(now, di)
+            self._extend_app(now, di, fg, extra_ex)
         self.tick_done.emit()
 
     def _clear_open_state(self) -> None:
@@ -74,6 +81,7 @@ class UsageCollector(QObject):
         self._app_row_id = None
         self._app_duration_ms = 0
         self._app_key = None
+        self._app_window_title = None
 
     def _extend_pc(self, now: float, di: int) -> None:
         if self._pc_row_id is None:
@@ -87,16 +95,18 @@ class UsageCollector(QObject):
                 start_ts=self._pc_start_ts,
                 end_ts=now,
                 duration_ms=self._pc_duration_ms,
+                commit=False,
             )
         else:
             self._pc_duration_ms += di
-            self._db.update_interval(self._pc_row_id, now, self._pc_duration_ms)
+            self._db.update_interval(self._pc_row_id, now, self._pc_duration_ms, commit=False)
 
     def _extend_app(self, now: float, di: int, fg: ForegroundInfo | None, extra: frozenset[str]) -> None:
         if fg is None or not should_track_foreground(fg.exe_path, fg.exe_name, extra):
             self._app_row_id = None
             self._app_duration_ms = 0
             self._app_key = None
+            self._app_window_title = None
             return
 
         key: tuple[str, str] = (fg.exe_path, fg.exe_name)
@@ -104,6 +114,7 @@ class UsageCollector(QObject):
 
         if self._app_row_id is None or key != self._app_key:
             self._app_key = key
+            self._app_window_title = title or None
             self._app_start_ts = now - di / 1000.0
             self._app_duration_ms = di
             self._app_row_id = self._db.insert_interval(
@@ -114,9 +125,11 @@ class UsageCollector(QObject):
                 start_ts=self._app_start_ts,
                 end_ts=now,
                 duration_ms=self._app_duration_ms,
+                commit=False,
             )
         else:
             self._app_duration_ms += di
-            self._db.update_interval(self._app_row_id, now, self._app_duration_ms)
-            if title:
-                self._db.update_window_title(self._app_row_id, title)
+            self._db.update_interval(self._app_row_id, now, self._app_duration_ms, commit=False)
+            if title and title != self._app_window_title:
+                self._app_window_title = title
+                self._db.update_window_title(self._app_row_id, title, commit=False)

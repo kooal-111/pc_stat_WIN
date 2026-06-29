@@ -35,8 +35,7 @@ def sync_run_key_if_autostart(autostart_should_be_on: bool) -> bool:
         was_stale = "--background" not in str(val).lower()
     except OSError:
         was_stale = True
-    set_enabled(True)
-    return was_stale
+    return was_stale if set_enabled(True) else False
 
 
 def is_enabled() -> bool:
@@ -48,12 +47,20 @@ def is_enabled() -> bool:
         return False
 
 
-def set_enabled(enabled: bool) -> None:
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+def set_enabled(enabled: bool) -> bool:
+    try:
+        k = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE)
+    except OSError:
+        return False
+    with k:
         if enabled:
-            winreg.SetValueEx(k, _APP_VALUE_NAME, 0, winreg.REG_SZ, launch_command())
+            try:
+                winreg.SetValueEx(k, _APP_VALUE_NAME, 0, winreg.REG_SZ, launch_command())
+            except OSError:
+                return False
         else:
             try:
                 winreg.DeleteValue(k, _APP_VALUE_NAME)
             except OSError:
                 pass
+    return True

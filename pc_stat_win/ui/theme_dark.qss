@@ -149,9 +149,17 @@ QPushButton#periodToday {
     color: #11111b;
 }
 
+QPushButton#periodToday[selected="true"] {
+    border: 2px solid #f5f5f5;
+}
+
 QPushButton#periodWeek {
     background-color: #cba6f7;
     color: #11111b;
+}
+
+QPushButton#periodWeek[selected="true"] {
+    border: 2px solid #f5f5f5;
 }
 
 QPushButton#periodMonth {
@@ -159,14 +167,26 @@ QPushButton#periodMonth {
     color: #11111b;
 }
 
+QPushButton#periodMonth[selected="true"] {
+    border: 2px solid #f5f5f5;
+}
+
 QPushButton#periodYear {
     background-color: #f9e2af;
     color: #11111b;
 }
 
+QPushButton#periodYear[selected="true"] {
+    border: 2px solid #f5f5f5;
+}
+
 QPushButton#periodAll {
     background-color: #94e2d5;
     color: #11111b;
+}
+
+QPushButton#periodAll[selected="true"] {
+    border: 2px solid #f5f5f5;
 }
 
 QTableWidget {
@@ -249,4 +269,81 @@ QMenu::item {
 
 QMenu::item:selected {
     background-color: #45475a;
+}
+
+/* Modern overrides */
+QFrame#card {
+    border-radius: 8px;
+    padding: 6px;
+}
+
+QFrame#kpiCard {
+    background-color: #181825;
+    border: 1px solid #34364a;
+    border-radius: 8px;
+    padding: 10px;
+}
+
+QLabel#kpiLabel {
+    color: #a6adc8;
+    font-size: 12px;
+}
+
+QLabel#kpiValue {
+    color: #f5f7ff;
+    font-size: 18px;
+    font-weight: 700;
+}
+
+QPushButton {
+    border: 2px solid transparent;
+}
+
+QPushButton:hover {
+    background-color: #5b6078;
+}
+
+QPushButton:pressed {
+    background-color: #6c7086;
+}
+
+QPushButton:disabled {
+    background-color: #2b2d3c;
+    color: #7f849c;
+}
+
+QPushButton[segment="true"] {
+    background-color: #2b2d3c;
+    color: #cdd6f4;
+    border: 2px solid #383b50;
+    border-radius: 8px;
+}
+
+QPushButton[segment="true"]:hover {
+    background-color: #34364a;
+}
+
+QPushButton[segment="true"][selected="true"] {
+    background-color: #3b82f6;
+    color: #ffffff;
+    border-color: #93c5fd;
+}
+
+QPushButton#periodToday,
+QPushButton#periodWeek,
+QPushButton#periodMonth,
+QPushButton#periodYear,
+QPushButton#periodAll {
+    background-color: #2b2d3c;
+    color: #cdd6f4;
+}
+
+QPushButton#periodToday[selected="true"],
+QPushButton#periodWeek[selected="true"],
+QPushButton#periodMonth[selected="true"],
+QPushButton#periodYear[selected="true"],
+QPushButton#periodAll[selected="true"] {
+    background-color: #3b82f6;
+    color: #ffffff;
+    border: 2px solid #93c5fd;
 }

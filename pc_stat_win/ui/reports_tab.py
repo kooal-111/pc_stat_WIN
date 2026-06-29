@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QBrush, QColor, QPainter
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import QFrame, QLabel, QScrollArea, QVBoxLayout, QWidget
 
-from pc_stat_win.categories import ALL_CATEGORY_KEYS, CATEGORY_LABELS_RU
-from pc_stat_win.db import Database
+from pc_stat_win.categories import ALL_CATEGORY_KEYS, CATEGORY_COLORS, CATEGORY_LABELS_RU, OTHER
+from pc_stat_win.db import Database, PeriodStats
 from pc_stat_win.formatting import format_duration_ms
 
 try:
@@ -28,6 +28,7 @@ class ReportsTab(QWidget):
     def __init__(self, db: Database) -> None:
         super().__init__()
         self._db = db
+        self._text_color = QColor("#cdd6f4")
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -71,9 +72,11 @@ class ReportsTab(QWidget):
         if theme_key == "light":
             bg = QColor("#f0f1f4")
             plot = QColor("#eceef2")
+            self._text_color = QColor("#2f3440")
         else:
             bg = QColor("#1e1e2e")
             plot = QColor("#262636")
+            self._text_color = QColor("#d7def8")
         br_bg = QBrush(bg)
         br_plot = QBrush(plot)
         for ch in (self._chart_pie, self._chart_bar):
@@ -81,14 +84,18 @@ class ReportsTab(QWidget):
             ch.setBackgroundBrush(br_bg)
             ch.setPlotAreaBackgroundVisible(True)
             ch.setPlotAreaBackgroundBrush(br_plot)
+            ch.setTitleBrush(QBrush(self._text_color))
+            ch.legend().setLabelBrush(QBrush(self._text_color))
 
-    def refresh(self, q_from: float, q_to: float) -> None:
-        pc_ms = self._db.total_pc_ms(q_from, q_to)
-        by_cat = self._db.totals_by_category(q_from, q_to)
-        apps = self._db.totals_by_app(q_from, q_to)
+    def refresh(self, stats: PeriodStats) -> None:
+        pc_ms = stats.pc_ms
+        by_cat = stats.by_category
+        apps = stats.apps
+        app_ms = stats.app_ms
 
         lines = [
             f"Активное время ПК за период: {format_duration_ms(pc_ms)}.",
+            f"Покрытие приложениями: {format_duration_ms(app_ms)} ({stats.coverage_pct:.1f}% от активного времени ПК).",
             "",
             "По категориям (по приложениям в фокусе):",
         ]
@@ -97,14 +104,20 @@ class ReportsTab(QWidget):
             if ms < 0.5:
                 continue
             label = CATEGORY_LABELS_RU.get(key, key)
-            pct = 100.0 * ms / pc_ms if pc_ms > 0 else 0.0
+            pct = 100.0 * ms / app_ms if app_ms > 0 else 0.0
             lines.append(f"  • {label}: {format_duration_ms(ms)} ({pct:.1f}%)")
         lines.append("")
         lines.append("Топ-5 приложений:")
         for i, a in enumerate(apps[:5], start=1):
-            c = self._db.resolve_category(a.exe_path)
+            c = a.category or self._db.resolve_category(a.exe_path)
             cn = CATEGORY_LABELS_RU.get(c, c)
             lines.append(f"  {i}. {a.exe_name or '?'} — {format_duration_ms(a.active_ms)} ({cn})")
+        other_apps = [a for a in apps if (a.category or self._db.resolve_category(a.exe_path)) == OTHER]
+        if other_apps:
+            lines.append("")
+            lines.append("Топ прочего для донастройки правил:")
+            for i, a in enumerate(other_apps[:5], start=1):
+                lines.append(f"  {i}. {a.exe_name or '?'} — {format_duration_ms(a.active_ms)}")
         self._summary.setText("\n".join(lines))
 
         if not _HAS_CHARTS:
@@ -115,7 +128,9 @@ class ReportsTab(QWidget):
         for key in ALL_CATEGORY_KEYS:
             ms = by_cat.get(key, 0.0)
             if ms > 0.5:
-                pie.append(CATEGORY_LABELS_RU.get(key, key), ms)
+                sl = pie.append(CATEGORY_LABELS_RU.get(key, key), ms)
+                sl.setBrush(QBrush(QColor(CATEGORY_COLORS.get(key, "#94a3b8"))))
+                sl.setLabelBrush(QBrush(self._text_color))
         if pie.count() > 0:
             self._chart_pie.addSeries(pie)
             self._chart_pie.legend().setAlignment(Qt.AlignmentFlag.AlignRight)
@@ -123,11 +138,12 @@ class ReportsTab(QWidget):
         for ax in self._chart_bar.axes():
             self._chart_bar.removeAxis(ax)
         self._chart_bar.removeAllSeries()
-        mode, series = self._db.chart_pc_active_series(q_from, q_to)
+        mode, series = stats.chart_mode, stats.chart_series
         if not series:
             self._chart_bar.setTitle("Нет данных для графика активности")
             return
         bar_set = QBarSet("Активность, ч")
+        bar_set.setBrush(QBrush(QColor("#3b82f6")))
         categories: list[str] = []
         max_v = 0.0
         for label, ms in series:
@@ -144,11 +160,15 @@ class ReportsTab(QWidget):
         axis_x = QBarCategoryAxis()
         for c in categories:
             axis_x.append(c)
+        axis_x.setLabelsBrush(QBrush(self._text_color))
         self._chart_bar.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
         bs.attachAxis(axis_x)
 
         axis_y = QValueAxis()
         axis_y.setTitleText("Часы" if mode == "hour" else "Часы за день")
         axis_y.setRange(0, max(0.5, max_v * 1.15))
+        axis_y.setLabelsBrush(QBrush(self._text_color))
+        axis_y.setTitleBrush(QBrush(self._text_color))
+        axis_y.setGridLinePen(QPen(QColor("#64748b"), 1))
         self._chart_bar.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
         bs.attachAxis(axis_y)

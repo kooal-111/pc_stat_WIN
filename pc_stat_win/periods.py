@@ -42,3 +42,23 @@ def period_range(
         return start.timestamp(), now
 
     return 0.0, now
+
+
+def previous_period_range(period: Period, q_from: float, q_to: float) -> tuple[float, float] | None:
+    if period == "all" or q_to <= q_from:
+        return None
+    span = q_to - q_from
+    if period == "today":
+        return q_from - 86400.0, q_to - 86400.0
+    if period == "week":
+        return q_from - 7 * 86400.0, q_to - 7 * 86400.0
+    if period == "month":
+        local_start = datetime.fromtimestamp(q_from).astimezone()
+        prev_end = local_start
+        prev_start = (local_start.replace(day=1) - timedelta(days=1)).replace(day=1)
+        return prev_start.timestamp(), min(prev_end.timestamp(), prev_start.timestamp() + span)
+    if period == "year":
+        local_start = datetime.fromtimestamp(q_from).astimezone()
+        prev_start = local_start.replace(year=local_start.year - 1)
+        return prev_start.timestamp(), min(q_from, prev_start.timestamp() + span)
+    return q_from - span, q_from

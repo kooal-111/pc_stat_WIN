@@ -58,7 +58,7 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$releasesUrl = ""
+$releasesUrl = "https://github.com/kooal-111/pc_stat_WIN/releases"
 try {
     $origin = git remote get-url origin 2>$null
     if ($origin -match "github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$") {
@@ -66,8 +66,4 @@ try {
     }
 } catch {}
 Write-Host ""
-if ($releasesUrl) {
-    Write-Host "Готово. Релизы: $releasesUrl"
-} else {
-    Write-Host "Готово. Откройте на GitHub страницу Releases вашего репозитория (remote origin не распознан как github.com)."
-}
+Write-Host "Готово. Релизы: $releasesUrl"

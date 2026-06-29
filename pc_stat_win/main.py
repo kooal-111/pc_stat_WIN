@@ -6,7 +6,7 @@ import time
 import psutil
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMessageBox, QMenu, QSystemTrayIcon
 
 from pc_stat_win import autostart
 from pc_stat_win.branding import app_icon
@@ -14,8 +14,10 @@ from pc_stat_win.collector import UsageCollector
 from pc_stat_win.config import POLL_INTERVAL_MS, ensure_app_dirs
 from pc_stat_win.db import Database
 from pc_stat_win.formatting import format_duration_seconds
+from pc_stat_win.single_instance import SingleInstance
 from pc_stat_win.ui.main_window import MainWindow
 from pc_stat_win.ui.styles import load_stylesheet
+from pc_stat_win.version import APP_VERSION
 
 
 def _argv_without_background_flag() -> list[str]:
@@ -32,18 +34,25 @@ def _seconds_since_boot() -> float:
 def main() -> int:
     ensure_app_dirs()
     db_path = ensure_app_dirs()
-    db = Database(db_path)
-    registry_was_stale = autostart.sync_run_key_if_autostart(db.get_autostart_enabled())
-    # Первый запуск после обновления: в реестре ещё старая строка без --background — Windows не передаёт флаг.
-    # Скрываем окно только вскоре после загрузки ОС, чтобы не спрятать окно при ручном запуске позже.
-    fresh_boot_session = _seconds_since_boot() < 300.0
-    start_to_tray_only = ("--background" in sys.argv) or (
-        registry_was_stale and fresh_boot_session and db.get_autostart_enabled()
-    )
-
     app = QApplication(_argv_without_background_flag())
     app.setApplicationName("PC Stat")
-    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationVersion(APP_VERSION)
+
+    instance = SingleInstance()
+    if instance.already_running:
+        QMessageBox.information(
+            None,
+            "PC Stat",
+            "PC Stat уже запущен. Откройте окно через значок в области уведомлений.",
+        )
+        instance.close()
+        return 0
+
+    db = Database(db_path)
+    autostart.sync_run_key_if_autostart(db.get_autostart_enabled())
+    start_to_tray_only = "--background" in sys.argv
+    tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+    app.setQuitOnLastWindowClosed(not tray_available)
     theme = db.get_setting("ui_theme", "dark") or "dark"
     if theme not in ("dark", "light"):
         theme = "dark"
@@ -62,19 +71,30 @@ def main() -> int:
     app.setWindowIcon(icon)
 
     collector = UsageCollector(db, poll_interval_ms=POLL_INTERVAL_MS)
-    win = MainWindow(db, collector, window_icon=icon)
+    win = MainWindow(db, collector, window_icon=icon, tray_available=tray_available)
     collector.start()
 
-    tray = QSystemTrayIcon(app)
-    tray.setIcon(icon)
-    tray.setVisible(True)
+    tray: QSystemTrayIcon | None = None
 
-    menu = QMenu()
-    act_show = QAction("Открыть", app)
-    act_show.triggered.connect(win.show)
-    menu.addAction(act_show)
+    if tray_available:
+        tray = QSystemTrayIcon(app)
+        tray.setIcon(icon)
+        tray.setVisible(True)
 
-    act_uptime = QAction(app)
+        menu = QMenu()
+        act_show = QAction("Открыть", app)
+        act_show.triggered.connect(win.show)
+        menu.addAction(act_show)
+
+        act_uptime = QAction(app)
+        menu.addAction(act_uptime)
+        menu.addSeparator()
+        act_quit = QAction("Выход", app)
+        menu.addAction(act_quit)
+        tray.setContextMenu(menu)
+    else:
+        act_uptime = QAction(app)
+        act_quit = QAction("Выход", app)
     boot = float(psutil.boot_time())
 
     def refresh_tray() -> None:
@@ -83,18 +103,21 @@ def main() -> int:
 
     refresh_tray()
     collector.tick_done.connect(refresh_tray)
-    menu.addAction(act_uptime)
-    menu.addSeparator()
-    act_quit = QAction("Выход", app)
 
+    closed = False
     def on_quit() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
         collector.stop()
+        db.optimize()
         db.close()
+        instance.close()
         app.quit()
 
     act_quit.triggered.connect(on_quit)
-    menu.addAction(act_quit)
-    tray.setContextMenu(menu)
+    app.aboutToQuit.connect(on_quit)
 
     def tray_activated(reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -102,17 +125,21 @@ def main() -> int:
             win.raise_()
             win.activateWindow()
 
-    tray.activated.connect(tray_activated)
+    if tray is not None:
+        tray.activated.connect(tray_activated)
 
-    show_window = (not start_to_tray_only) and db.get_show_main_window_on_launch()
+    show_window = (not tray_available) or (
+        (not start_to_tray_only) and db.get_show_main_window_on_launch()
+    )
     if show_window:
         win.show()
-        tray.showMessage(
-            "PC Stat",
-            "Трекер запущен в фоне.",
-            QSystemTrayIcon.MessageIcon.Information,
-            3000,
-        )
+        if tray is not None:
+            tray.showMessage(
+                "PC Stat",
+                "Трекер запущен в фоне.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
     code = app.exec()
     return int(code)
 
