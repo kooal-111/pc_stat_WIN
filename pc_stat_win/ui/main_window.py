@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
+import logging
 import time
 from functools import partial
 
 import psutil
-from PySide6.QtCore import QSize, Qt, QTimer, Slot
-from PySide6.QtGui import QBrush, QCloseEvent, QColor, QFontMetrics, QIcon
+from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QIcon, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -16,7 +18,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -25,15 +27,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QStackedWidget,
+    QStyle,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from pc_stat_win import autostart
-from pc_stat_win.categories import CATEGORY_COLORS, CATEGORY_LABELS_RU, OTHER
+from pc_stat_win.categories import CATEGORY_LABELS_RU, OTHER
 from pc_stat_win.collector import UsageCollector
 from pc_stat_win.config import UI_REFRESH_INTERVAL_MS
 from pc_stat_win.db import AppStat, Database, PeriodStats
@@ -41,21 +47,22 @@ from pc_stat_win.exe_metadata import friendly_app_name
 from pc_stat_win.export import export_apps_csv
 from pc_stat_win.formatting import format_duration_ms, format_duration_seconds
 from pc_stat_win.periods import Period, period_range, previous_period_range
-from pc_stat_win.ui.icons import app_icon_for_exe
+from pc_stat_win.ui.app_table import AppFilterProxyModel, AppTableModel, CategoryDotDelegate
 from pc_stat_win.ui.reports_tab import ReportsTab
-from pc_stat_win.ui.styles import load_stylesheet
 
 
-class SortableItem(QTableWidgetItem):
-    def __lt__(self, other: QTableWidgetItem) -> bool:
-        left = self.data(Qt.ItemDataRole.UserRole)
-        right = other.data(Qt.ItemDataRole.UserRole)
-        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-            return float(left) < float(right)
-        return super().__lt__(other)
+LOGGER = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
+    theme_changed = Signal(str)
+    close_to_tray_requested = Signal()
+
+    PAGE_STATS = 0
+    PAGE_REPORTS = 1
+    PAGE_CATEGORIES = 2
+    PAGE_SETTINGS = 3
+
     def __init__(
         self,
         db: Database,
@@ -70,461 +77,515 @@ class MainWindow(QMainWindow):
         self._tray_available = tray_available
         self._last_stats: PeriodStats | None = None
         self._refresh_dirty = True
+        self._kpi_frames: list[QFrame] = []
+        self._kpi_columns = 0
+        self._selected_rule: int | None = None
+
         self.setWindowTitle("PC Stat — активность")
         if window_icon is not None and not window_icon.isNull():
             self.setWindowIcon(window_icon)
         self.setMinimumSize(920, 640)
+        self.resize(1180, 760)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, tray_available)
+
+        saved_period = self._db.get_setting("ui_period", "week") or "week"
+        self._current_period: Period = (
+            saved_period if saved_period in ("today", "week", "month", "year", "all") else "week"
+        )
         self._build()
+        self._restore_window_state()
+
         self._collector.tick_done.connect(self._mark_refresh_dirty)
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(UI_REFRESH_INTERVAL_MS)
+        self._refresh_timer.setInterval(max(10_000, UI_REFRESH_INTERVAL_MS))
+        self._refresh_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._refresh_timer.timeout.connect(self._refresh_if_dirty)
         self._refresh_timer.start()
-        self._optimize_timer = QTimer(self)
-        self._optimize_timer.setInterval(10 * 60 * 1000)
-        self._optimize_timer.timeout.connect(self._db.optimize)
-        self._optimize_timer.start()
-        self.refresh_stats(force_reports=True)
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(120)
+        self._search_timer.timeout.connect(self._apply_filters)
+        self.refresh_stats(force_reports=self._stack.currentIndex() == self.PAGE_REPORTS)
 
     def _build(self) -> None:
         central = QWidget()
+        central.setObjectName("windowSurface")
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
 
-        self._tabs = QTabWidget()
-        self._tabs.currentChanged.connect(self._on_tab_changed)
-        root.addWidget(self._tabs)
+        sidebar = QFrame()
+        sidebar.setObjectName("navigationSurface")
+        sidebar.setFixedWidth(188)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(12, 14, 12, 12)
+        side.setSpacing(6)
 
-        # --- Stats tab ---
-        stats_w = QWidget()
-        stats_layout = QVBoxLayout(stats_w)
+        brand = QLabel("PC Stat")
+        brand.setObjectName("brandTitle")
+        side.addWidget(brand)
+        subtitle = QLabel("Фокус и активность")
+        subtitle.setObjectName("secondaryText")
+        side.addWidget(subtitle)
+        side.addSpacing(16)
 
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Период:"))
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
+        self._nav_buttons: list[QPushButton] = []
+        nav_specs = [
+            ("Статистика", QStyle.StandardPixmap.SP_ComputerIcon),
+            ("Отчёты", QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            ("Категории", QStyle.StandardPixmap.SP_DirIcon),
+            ("Настройки", QStyle.StandardPixmap.SP_FileDialogContentsView),
+        ]
+        for index, (text, icon_kind) in enumerate(nav_specs):
+            button = QPushButton(text)
+            button.setProperty("navigation", True)
+            button.setCheckable(True)
+            button.setIcon(self.style().standardIcon(icon_kind))
+            button.setIconSize(QSize(18, 18))
+            button.clicked.connect(partial(self._set_page, index))
+            self._nav_group.addButton(button, index)
+            self._nav_buttons.append(button)
+            side.addWidget(button)
+        side.addStretch(1)
 
-        self._period_buttons: dict[Period, QPushButton] = {}
+        self._collector_status = QLabel("●  Сбор активен")
+        self._collector_status.setObjectName("statusOk")
+        side.addWidget(self._collector_status)
+        self._session_label = QLabel()
+        self._session_label.setObjectName("secondaryText")
+        self._session_label.setWordWrap(True)
+        side.addWidget(self._session_label)
+        root.addWidget(sidebar)
+
+        content = QVBoxLayout()
+        content.setSpacing(12)
+        header = QFrame()
+        header.setObjectName("glassSurface")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(14, 10, 14, 10)
+        self._page_title = QLabel("Статистика")
+        self._page_title.setObjectName("pageTitle")
+        header_layout.addWidget(self._page_title)
+        header_layout.addStretch(1)
+
+        self._period_host = QWidget()
+        period_layout = QHBoxLayout(self._period_host)
+        period_layout.setContentsMargins(0, 0, 0, 0)
+        period_layout.setSpacing(4)
         self._period_group = QButtonGroup(self)
         self._period_group.setExclusive(True)
-        period_buttons: list[tuple[str, Period, str]] = [
-            ("Сегодня", "today", "periodToday"),
-            ("Неделя", "week", "periodWeek"),
-            ("Месяц", "month", "periodMonth"),
-            ("Год", "year", "periodYear"),
-            ("Всё время", "all", "periodAll"),
-        ]
-        for label, key, oid in period_buttons:
-            b = QPushButton(label)
-            b.setObjectName(oid)
-            b.setProperty("segment", True)
-            b.setCheckable(True)
-            b.setAutoDefault(False)
-            b.clicked.connect(partial(self._set_period, key))
-            self._period_buttons[key] = b
-            self._period_group.addButton(b)
-            top.addWidget(b)
+        self._period_buttons: dict[Period, QPushButton] = {}
+        for label, key in (
+            ("Сегодня", "today"),
+            ("Неделя", "week"),
+            ("Месяц", "month"),
+            ("Год", "year"),
+            ("Всё", "all"),
+        ):
+            button = QPushButton(label)
+            button.setProperty("segment", True)
+            button.setCheckable(True)
+            button.clicked.connect(partial(self._set_period, key))
+            self._period_group.addButton(button)
+            self._period_buttons[key] = button
+            period_layout.addWidget(button)
+        header_layout.addWidget(self._period_host)
 
-        top.addStretch(1)
-        self._btn_export = QPushButton("Экспорт CSV…")
-        self._btn_export.setObjectName("btnExport")
+        self._btn_export = QPushButton("Экспорт")
+        self._btn_export.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
         self._btn_export.clicked.connect(self._export_csv)
-        top.addWidget(self._btn_export)
+        header_layout.addWidget(self._btn_export)
+        content.addWidget(header)
 
-        stats_layout.addLayout(top)
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_stats_page())
+        self._reports = ReportsTab(self._db)
+        self._stack.addWidget(self._reports)
+        self._stack.addWidget(self._build_categories_page())
+        self._stack.addWidget(self._build_settings_page())
+        self._stack.currentChanged.connect(self._on_page_changed)
+        content.addWidget(self._stack, 1)
+        root.addLayout(content, 1)
 
-        filters = QHBoxLayout()
-        filters.addWidget(QLabel("Фильтр:"))
+        saved_page = int(self._db.get_setting("ui_page", "0") or "0")
+        saved_page = max(0, min(self._stack.count() - 1, saved_page))
+        self._stack.setCurrentIndex(saved_page)
+        self._nav_buttons[saved_page].setChecked(True)
+        self._sync_period_buttons()
+        self._on_page_changed(saved_page)
+
+    def _build_stats_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("pageContent")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        filters = QFrame()
+        filters.setObjectName("glassSurface")
+        filter_layout = QHBoxLayout(filters)
+        filter_layout.setContentsMargins(12, 10, 12, 10)
         self._filter_search = QLineEdit()
-        self._filter_search.setPlaceholderText("поиск по приложению или пути")
-        self._filter_search.textChanged.connect(lambda _text: self._apply_current_stats())
-        filters.addWidget(self._filter_search, stretch=2)
+        self._filter_search.setClearButtonEnabled(True)
+        self._filter_search.setPlaceholderText("Поиск по приложению или пути")
+        self._filter_search.textChanged.connect(lambda _text: self._search_timer.start())
+        filter_layout.addWidget(self._filter_search, 1)
         self._filter_cat = QComboBox()
         self._filter_cat.addItem("Все категории", "")
         for key, label in CATEGORY_LABELS_RU.items():
             self._filter_cat.addItem(label, key)
-        self._filter_cat.currentIndexChanged.connect(lambda _idx: self._apply_current_stats())
-        filters.addWidget(self._filter_cat)
-        self._btn_rule_from_app = QPushButton("Создать правило")
-        self._btn_rule_from_app.clicked.connect(self._create_rule_from_selected_app)
-        filters.addWidget(self._btn_rule_from_app)
-        stats_layout.addLayout(filters)
+        self._filter_cat.currentIndexChanged.connect(self._apply_filters)
+        filter_layout.addWidget(self._filter_cat)
+        self._btn_rule_from_app = QPushButton("Новое правило")
+        self._btn_rule_from_app.setEnabled(False)
+        self._btn_rule_from_app.clicked.connect(self._prepare_rule_from_selected_app)
+        filter_layout.addWidget(self._btn_rule_from_app)
+        layout.addWidget(filters)
 
-        card = QFrame()
-        card.setObjectName("card")
-        card_l = QVBoxLayout(card)
-        kpi_row = QHBoxLayout()
+        self._kpi_host = QFrame()
+        self._kpi_host.setObjectName("glassSurface")
+        self._kpi_grid = QGridLayout(self._kpi_host)
+        self._kpi_grid.setContentsMargins(12, 12, 12, 12)
+        self._kpi_grid.setSpacing(8)
         self._kpi_labels: dict[str, QLabel] = {}
         for key, title in (
-            ("active", "Активно"),
+            ("active", "Активное время"),
             ("uptime", "Работа ПК"),
             ("share", "Доля активности"),
-            ("coverage", "Покрытие прилож."),
+            ("coverage", "Покрытие"),
             ("apps", "Приложений"),
-            ("session", "Сессия"),
+            ("session", "Текущая сессия"),
         ):
-            kpi = QFrame()
-            kpi.setObjectName("kpiCard")
-            kpi_l = QVBoxLayout(kpi)
+            item = QFrame()
+            item.setObjectName("metricBlock")
+            item_layout = QVBoxLayout(item)
+            item_layout.setContentsMargins(10, 7, 10, 7)
             name = QLabel(title)
-            name.setObjectName("kpiLabel")
+            name.setObjectName("secondaryText")
             value = QLabel("—")
-            value.setObjectName("kpiValue")
-            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            kpi_l.addWidget(name)
-            kpi_l.addWidget(value)
-            kpi_row.addWidget(kpi)
+            value.setObjectName("metricValue")
+            item_layout.addWidget(name)
+            item_layout.addWidget(value)
+            self._kpi_frames.append(item)
             self._kpi_labels[key] = value
-        card_l.addLayout(kpi_row)
-        self._period_stats = QLabel()
-        self._period_stats.setObjectName("periodStatsLabel")
-        self._period_stats.setWordWrap(True)
-        card_l.addWidget(self._period_stats)
-        stats_layout.addWidget(card)
+        self._reflow_kpis(3)
+        layout.addWidget(self._kpi_host)
 
-        top5_box = QGroupBox("Топ-5 приложений по активному времени")
-        top5_box.setObjectName("top5Group")
-        top5_l = QVBoxLayout(top5_box)
-        self._top5_bars: list[tuple[QLabel, QProgressBar]] = []
-        for idx in range(5):
+        top_surface = QFrame()
+        top_surface.setObjectName("glassSurface")
+        top_layout = QVBoxLayout(top_surface)
+        top_layout.setContentsMargins(14, 12, 14, 12)
+        top_title = QLabel("Топ приложений")
+        top_title.setObjectName("sectionTitle")
+        top_layout.addWidget(top_title)
+        self._top_rows: list[tuple[QLabel, QLabel, QProgressBar]] = []
+        for _index in range(5):
             row = QHBoxLayout()
-            name_lbl = QLabel("—")
-            name_lbl.setMinimumWidth(180)
-            name_lbl.setObjectName(f"top5name{idx}")
+            name = QLabel("—")
+            name.setMinimumWidth(160)
+            duration = QLabel("—")
+            duration.setObjectName("secondaryText")
+            duration.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            duration.setMinimumWidth(90)
             bar = QProgressBar()
-            bar.setRange(0, 100)
-            bar.setValue(0)
-            bar.setFormat("—")
-            bar.setObjectName(f"top5bar{idx}")
-            bar.setMinimumHeight(22)
-            row.addWidget(name_lbl)
-            row.addWidget(bar, stretch=1)
-            top5_l.addLayout(row)
-            self._top5_bars.append((name_lbl, bar))
-        stats_layout.addWidget(top5_box)
+            bar.setRange(0, 1000)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(8)
+            row.addWidget(name)
+            row.addWidget(bar, 1)
+            row.addWidget(duration)
+            top_layout.addLayout(row)
+            self._top_rows.append((name, duration, bar))
+        layout.addWidget(top_surface)
 
-        self._table = QTableWidget(0, 5)
-        self._table.setObjectName("appsTable")
+        table_surface = QFrame()
+        table_surface.setObjectName("glassSurface")
+        table_layout = QVBoxLayout(table_surface)
+        table_layout.setContentsMargins(8, 8, 8, 8)
+        self._app_model = AppTableModel(self)
+        self._app_proxy = AppFilterProxyModel(self)
+        self._app_proxy.setSourceModel(self._app_model)
+        self._table = QTableView()
+        self._table.setModel(self._app_proxy)
         self._table.setAlternatingRowColors(True)
-        self._table.setIconSize(QSize(28, 28))
         self._table.setShowGrid(False)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setWordWrap(False)
+        self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._table.setSortingEnabled(True)
         self._table.verticalHeader().setVisible(False)
-        self._table.setHorizontalHeaderLabels(
-            ["Приложение", "Категория", "Активно", "Доля", "Путь"]
-        )
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.verticalHeader().setDefaultSectionSize(42)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2, 3):
+            self._table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        stats_layout.addWidget(self._table)
-
-        self._tabs.addTab(stats_w, "Статистика")
-
-        # --- Reports ---
-        self._reports = ReportsTab(self._db)
-        self._tabs.addTab(self._reports, "Отчёты")
-
-        # --- Categories ---
-        cat_w = QWidget()
-        cat_l = QVBoxLayout(cat_w)
-        cat_l.addWidget(
-            QLabel(
-                "Правила сопоставляются сверху вниз (приоритет). "
-                "«Точное имя exe» — только basename; «Фрагмент пути» — подстрока в полном пути."
-            )
+        self._table.setItemDelegateForColumn(1, CategoryDotDelegate(self._table))
+        self._table.selectionModel().selectionChanged.connect(
+            lambda *_args: self._btn_rule_from_app.setEnabled(self._selected_app() is not None)
         )
+        table_layout.addWidget(self._table)
+        layout.addWidget(table_surface, 1)
+        return page
+
+    def _build_categories_page(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        table_surface = QFrame()
+        table_surface.setObjectName("glassSurface")
+        table_layout = QVBoxLayout(table_surface)
+        table_layout.setContentsMargins(12, 12, 12, 12)
+        title = QLabel("Правила классификации")
+        title.setObjectName("sectionTitle")
+        table_layout.addWidget(title)
         self._rules_table = QTableWidget(0, 5)
-        self._rules_table.setHorizontalHeaderLabels(["ID", "Приоритет", "Шаблон", "Тип", "Категория"])
+        self._rules_table.setHorizontalHeaderLabels(
+            ["ID", "Приоритет", "Шаблон", "Тип", "Категория"]
+        )
         self._rules_table.hideColumn(0)
         self._rules_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._rules_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._rules_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._rules_table.setShowGrid(False)
+        self._rules_table.verticalHeader().setVisible(False)
+        self._rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self._rules_table.itemSelectionChanged.connect(self._load_selected_rule)
-        cat_l.addWidget(self._rules_table)
+        table_layout.addWidget(self._rules_table)
+        layout.addWidget(table_surface, 2)
 
-        form = QHBoxLayout()
+        editor = QFrame()
+        editor.setObjectName("glassSurface")
+        editor.setMinimumWidth(310)
+        editor_layout = QVBoxLayout(editor)
+        editor_layout.setContentsMargins(16, 14, 16, 14)
+        editor_title = QLabel("Редактор правила")
+        editor_title.setObjectName("sectionTitle")
+        editor_layout.addWidget(editor_title)
         self._rule_match = QLineEdit()
-        self._rule_match.setPlaceholderText("chrome.exe или Games")
+        self._rule_match.setPlaceholderText("chrome.exe или фрагмент пути")
+        editor_layout.addWidget(QLabel("Шаблон"))
+        editor_layout.addWidget(self._rule_match)
         self._rule_kind = QComboBox()
         self._rule_kind.addItem("Точное имя exe", "exact_basename")
         self._rule_kind.addItem("Фрагмент пути", "path_contains")
+        editor_layout.addWidget(QLabel("Тип совпадения"))
+        editor_layout.addWidget(self._rule_kind)
         self._rule_cat = QComboBox()
-        for key, lab in CATEGORY_LABELS_RU.items():
-            self._rule_cat.addItem(lab, key)
-        self._btn_rule_add = QPushButton("Добавить")
-        self._btn_rule_add.clicked.connect(self._add_category_rule)
-        self._btn_rule_save = QPushButton("Сохранить")
-        self._btn_rule_save.clicked.connect(self._save_category_rule)
-        btn_up = QPushButton("Выше")
-        btn_up.clicked.connect(partial(self._move_category_rule, -1))
-        btn_down = QPushButton("Ниже")
-        btn_down.clicked.connect(partial(self._move_category_rule, 1))
-        btn_del = QPushButton("Удалить")
-        btn_del.clicked.connect(self._delete_category_rule)
-        form.addWidget(self._rule_match, stretch=2)
-        form.addWidget(self._rule_kind)
-        form.addWidget(self._rule_cat)
-        form.addWidget(self._btn_rule_add)
-        form.addWidget(self._btn_rule_save)
-        form.addWidget(btn_del)
-        form.addWidget(btn_up)
-        form.addWidget(btn_down)
-        cat_l.addLayout(form)
-        self._tabs.addTab(cat_w, "Категории")
+        for key, label in CATEGORY_LABELS_RU.items():
+            self._rule_cat.addItem(label, key)
+        editor_layout.addWidget(QLabel("Категория"))
+        editor_layout.addWidget(self._rule_cat)
+        editor_layout.addSpacing(8)
 
-        # --- Settings tab ---
-        set_w = QWidget()
-        form_set = QFormLayout(set_w)
+        save_row = QHBoxLayout()
+        add = QPushButton("Добавить")
+        add.clicked.connect(self._add_category_rule)
+        save = QPushButton("Сохранить")
+        save.clicked.connect(self._save_category_rule)
+        save_row.addWidget(add)
+        save_row.addWidget(save)
+        editor_layout.addLayout(save_row)
 
+        icon_row = QHBoxLayout()
+        up = self._icon_button(QStyle.StandardPixmap.SP_ArrowUp, "Поднять правило")
+        up.clicked.connect(partial(self._move_category_rule, -1))
+        down = self._icon_button(QStyle.StandardPixmap.SP_ArrowDown, "Опустить правило")
+        down.clicked.connect(partial(self._move_category_rule, 1))
+        delete = self._icon_button(QStyle.StandardPixmap.SP_TrashIcon, "Удалить правило")
+        delete.setProperty("danger", True)
+        delete.clicked.connect(self._delete_category_rule)
+        icon_row.addWidget(up)
+        icon_row.addWidget(down)
+        icon_row.addStretch(1)
+        icon_row.addWidget(delete)
+        editor_layout.addLayout(icon_row)
+        editor_layout.addStretch(1)
+        layout.addWidget(editor, 1)
+        self._refresh_rules_table()
+        return page
+
+    def _build_settings_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        page = QWidget()
+        page.setObjectName("pageContent")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 8, 16)
+        layout.setSpacing(12)
+
+        appearance = QFrame()
+        appearance.setObjectName("glassSurface")
+        appearance_form = QFormLayout(appearance)
+        appearance_form.setContentsMargins(16, 14, 16, 14)
         self._theme_combo = QComboBox()
+        self._theme_combo.addItem("Как в Windows", "system")
         self._theme_combo.addItem("Тёмная", "dark")
         self._theme_combo.addItem("Светлая", "light")
-        th = self._db.get_setting("ui_theme", "dark") or "dark"
-        self._theme_combo.blockSignals(True)
-        self._theme_combo.setCurrentIndex(0 if th == "dark" else 1)
-        self._theme_combo.blockSignals(False)
+        theme = self._db.get_setting("ui_theme", "system") or "system"
+        theme_index = self._theme_combo.findData(theme)
+        self._theme_combo.setCurrentIndex(max(0, theme_index))
         self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
-        form_set.addRow("Тема оформления:", self._theme_combo)
+        appearance_form.addRow("Оформление", self._theme_combo)
+        layout.addWidget(appearance)
 
+        behavior = QFrame()
+        behavior.setObjectName("glassSurface")
+        behavior_form = QFormLayout(behavior)
+        behavior_form.setContentsMargins(16, 14, 16, 14)
         self._autostart_cb = QCheckBox("Запускать вместе с Windows")
         self._autostart_cb.setChecked(self._db.get_autostart_enabled())
         self._autostart_cb.toggled.connect(self._save_autostart)
-        form_set.addRow(self._autostart_cb)
-
-        self._close_to_tray_cb = QCheckBox("Сворачивать в трей при закрытии окна")
+        behavior_form.addRow(self._autostart_cb)
+        self._close_to_tray_cb = QCheckBox("Закрывать окно в область уведомлений")
         self._close_to_tray_cb.setChecked(
             (self._db.get_setting("close_to_tray", "1") or "1") == "1"
         )
+        self._close_to_tray_cb.setEnabled(self._tray_available)
         self._close_to_tray_cb.toggled.connect(
             lambda checked: self._db.set_setting("close_to_tray", "1" if checked else "0")
         )
-        self._close_to_tray_cb.setEnabled(self._tray_available)
-        form_set.addRow(self._close_to_tray_cb)
-
+        behavior_form.addRow(self._close_to_tray_cb)
         self._afk = QDoubleSpinBox()
         self._afk.setRange(5.0, 3600.0)
         self._afk.setSingleStep(10.0)
         self._afk.setSuffix(" с")
         self._afk.setValue(self._db.get_afk_seconds())
-        self._afk.valueChanged.connect(self._save_afk)
-        form_set.addRow("Порог «отошёл от ПК» (нет мыши/клавиатуры):", self._afk)
+        self._afk.editingFinished.connect(self._save_afk)
+        behavior_form.addRow("Порог AFK", self._afk)
+        layout.addWidget(behavior)
 
-        ex = QGroupBox("Исключить из учёта приложения (имена exe через запятую)")
-        ex_l = QVBoxLayout(ex)
+        exclusions = QFrame()
+        exclusions.setObjectName("glassSurface")
+        exclusions_layout = QVBoxLayout(exclusions)
+        exclusions_layout.setContentsMargins(16, 14, 16, 14)
+        title = QLabel("Исключённые приложения")
+        title.setObjectName("sectionTitle")
+        exclusions_layout.addWidget(title)
+        hint = QLabel("Имена exe через запятую. Эти приложения не попадут в статистику.")
+        hint.setObjectName("secondaryText")
+        exclusions_layout.addWidget(hint)
         self._excluded = QLineEdit()
         self._excluded.setText(", ".join(sorted(self._db.get_excluded_exes())))
         self._excluded.editingFinished.connect(self._save_excluded)
-        ex_l.addWidget(self._excluded)
-        form_set.addRow(ex)
+        exclusions_layout.addWidget(self._excluded)
+        layout.addWidget(exclusions)
 
-        hint = QLabel(
-            "Учитывается только активное окно (foreground): при отсутствии ввода дольше порога AFK "
-            "время не идёт ни для ПК, ни для приложения. Пока ПК выключен, данные не пишутся.\n"
-            f"База данных: {self._db.path}"
-        )
-        hint.setWordWrap(True)
-        form_set.addRow(hint)
+        location = QLabel(f"База данных: {self._db.path}")
+        location.setObjectName("secondaryText")
+        location.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(location)
+        layout.addStretch(1)
+        scroll.setWidget(page)
+        return scroll
 
-        self._tabs.addTab(set_w, "Настройки")
+    def _icon_button(self, icon: QStyle.StandardPixmap, tooltip: str) -> QToolButton:
+        button = QToolButton()
+        button.setIcon(self.style().standardIcon(icon))
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.setFixedSize(36, 36)
+        return button
 
-        self._current_period: Period = "week"
-        self._apply_period_label()
+    def _set_page(self, index: int) -> None:
+        self._stack.setCurrentIndex(index)
+
+    def _on_page_changed(self, index: int) -> None:
+        titles = ("Статистика", "Отчёты", "Категории", "Настройки")
+        self._page_title.setText(titles[index])
+        for button_index, button in enumerate(self._nav_buttons):
+            button.setChecked(button_index == index)
+        self._period_host.setVisible(index in (self.PAGE_STATS, self.PAGE_REPORTS))
+        self._btn_export.setVisible(index in (self.PAGE_STATS, self.PAGE_REPORTS))
+        self._reports.set_active(index == self.PAGE_REPORTS)
+        self._db.set_setting("ui_page", str(index))
+        if index == self.PAGE_REPORTS:
+            if self._refresh_dirty:
+                self.refresh_stats(force_reports=True)
+            elif self._last_stats is not None:
+                self._reports.refresh(self._last_stats)
+        elif index == self.PAGE_CATEGORIES:
+            self._refresh_rules_table()
+
+    def _set_period(self, period: Period) -> None:
+        self._current_period = period
+        self._db.set_setting("ui_period", period)
         self._sync_period_buttons()
-        self._refresh_rules_table()
-        th_key = th if th in ("dark", "light") else "dark"
-        self._reports.apply_chart_theme(th_key)
-
-    def _refresh_rules_table(self) -> None:
-        rows = self._db.list_category_rules()
-        current_id = self._selected_rule_id()
-        self._rules_table.blockSignals(True)
-        self._rules_table.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            rid = int(r["id"])
-            it0 = QTableWidgetItem(str(rid))
-            it0.setData(Qt.ItemDataRole.UserRole, rid)
-            self._rules_table.setItem(i, 0, it0)
-            self._rules_table.setItem(i, 1, SortableItem(str(r["priority"])))
-            self._rules_table.item(i, 1).setData(Qt.ItemDataRole.UserRole, int(r["priority"]))
-            self._rules_table.setItem(i, 2, QTableWidgetItem(r["match_text"]))
-            kind_label = "Точное имя exe" if r["match_kind"] == "exact_basename" else "Фрагмент пути"
-            kind_item = QTableWidgetItem(kind_label)
-            kind_item.setData(Qt.ItemDataRole.UserRole, r["match_kind"])
-            self._rules_table.setItem(i, 3, kind_item)
-            cat = r["category"]
-            self._rules_table.setItem(
-                i, 4, QTableWidgetItem(CATEGORY_LABELS_RU.get(cat, cat))
-            )
-            if current_id == rid:
-                self._rules_table.selectRow(i)
-        self._rules_table.blockSignals(False)
-
-    def _selected_rule_id(self) -> int | None:
-        row = self._rules_table.currentRow()
-        if row < 0:
-            return None
-        it = self._rules_table.item(row, 0)
-        if it is None:
-            return None
-        rid = it.data(Qt.ItemDataRole.UserRole)
-        return int(rid) if rid is not None else None
-
-    @Slot()
-    def _load_selected_rule(self) -> None:
-        row = self._rules_table.currentRow()
-        if row < 0:
-            return
-        match = self._rules_table.item(row, 2)
-        kind = self._rules_table.item(row, 3)
-        cat = self._rules_table.item(row, 4)
-        if match is not None:
-            self._rule_match.setText(match.text())
-        if kind is not None:
-            idx = self._rule_kind.findData(kind.data(Qt.ItemDataRole.UserRole))
-            if idx >= 0:
-                self._rule_kind.setCurrentIndex(idx)
-        if cat is not None:
-            for i in range(self._rule_cat.count()):
-                if self._rule_cat.itemText(i) == cat.text():
-                    self._rule_cat.setCurrentIndex(i)
-                    break
-
-    @Slot()
-    def _add_category_rule(self) -> None:
-        m = self._rule_match.text().strip()
-        if not m:
-            QMessageBox.warning(self, "Категории", "Введите шаблон.")
-            return
-        kind = self._rule_kind.currentData()
-        cat = self._rule_cat.currentData()
-        self._db.add_category_rule(m, str(kind), str(cat))
-        self._rule_match.clear()
-        self._refresh_rules_table()
-        self.refresh_stats(force_reports=True)
-
-    @Slot()
-    def _save_category_rule(self) -> None:
-        rid = self._selected_rule_id()
-        if rid is None:
-            return
-        m = self._rule_match.text().strip()
-        if not m:
-            QMessageBox.warning(self, "Категории", "Введите шаблон.")
-            return
-        self._db.update_category_rule(
-            rid, m, str(self._rule_kind.currentData()), str(self._rule_cat.currentData())
-        )
-        self._refresh_rules_table()
-        self.refresh_stats(force_reports=True)
-
-    @Slot()
-    def _delete_category_rule(self) -> None:
-        row = self._rules_table.currentRow()
-        if row < 0:
-            return
-        it = self._rules_table.item(row, 0)
-        if it is None:
-            return
-        rid = self._selected_rule_id()
-        if rid is None:
-            return
-        self._db.delete_category_rule(rid)
-        self._refresh_rules_table()
-        self.refresh_stats(force_reports=True)
-
-    def _move_category_rule(self, direction: int) -> None:
-        rid = self._selected_rule_id()
-        if rid is None:
-            return
-        self._db.move_category_rule(rid, direction)
-        self._refresh_rules_table()
-        self.refresh_stats(force_reports=True)
-
-    @Slot()
-    def _save_autostart(self) -> None:
-        en = self._autostart_cb.isChecked()
-        if autostart.set_enabled(en):
-            self._db.set_autostart_enabled(en)
-            return
-        self._autostart_cb.blockSignals(True)
-        self._autostart_cb.setChecked(not en)
-        self._autostart_cb.blockSignals(False)
-        QMessageBox.warning(self, "Автозапуск", "Windows не разрешила изменить автозапуск.")
+        self.refresh_stats(force_reports=self._stack.currentIndex() == self.PAGE_REPORTS)
 
     def _sync_period_buttons(self) -> None:
-        for key, btn in self._period_buttons.items():
+        for key, button in self._period_buttons.items():
             selected = key == self._current_period
-            btn.setChecked(selected)
-            btn.setProperty("selected", selected)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-
-    @Slot()
-    def _on_theme_changed(self) -> None:
-        name = self._theme_combo.currentData()
-        if not name:
-            return
-        self._db.set_setting("ui_theme", str(name))
-        app = QApplication.instance()
-        if app:
-            app.setStyleSheet(load_stylesheet(str(name)))
-        sh = app.styleHints() if app else None
-        if sh and hasattr(sh, "setColorScheme"):
-            try:
-                sh.setColorScheme(
-                    Qt.ColorScheme.Dark
-                    if name == "dark"
-                    else Qt.ColorScheme.Light
-                )
-            except Exception:
-                pass
-        self._reports.apply_chart_theme(str(name))
-
-    def _set_period(self, p: Period) -> None:
-        self._current_period = p
-        self._apply_period_label()
-        self._sync_period_buttons()
-        self.refresh_stats(force_reports=True)
-
-    def _apply_period_label(self) -> None:
-        return
+            button.setChecked(selected)
+            button.setProperty("selected", selected)
+            button.style().unpolish(button)
+            button.style().polish(button)
 
     def _period_bounds(self) -> tuple[float, float]:
         if self._current_period == "all":
-            ear = self._db.earliest_interval_start()
-            return period_range("all", all_start=ear)
+            return period_range("all", all_start=self._db.earliest_interval_start())
         return period_range(self._current_period)
 
     @Slot()
-    def _save_afk(self) -> None:
-        self._db.set_afk_seconds(float(self._afk.value()))
-
-    @Slot()
-    def _save_excluded(self) -> None:
-        raw = self._excluded.text()
-        parts = {p.strip().lower() for p in raw.replace(";", ",").split(",") if p.strip()}
-        self._db.set_excluded_exes(parts)
-
-    @Slot()
-    def _export_csv(self) -> None:
-        path, _sel = QFileDialog.getSaveFileName(
-            self,
-            "Сохранить отчёт CSV",
-            "",
-            "CSV (*.csv);;Все файлы (*.*)",
-        )
-        if not path:
-            return
-        if not path.lower().endswith(".csv"):
-            path += ".csv"
-        q_from, q_to = self._period_bounds()
+    def refresh_stats(self, *, force_reports: bool = False) -> None:
         try:
-            export_apps_csv(self._db, q_from, q_to, path, self._last_stats)
-        except OSError as e:
-            QMessageBox.warning(self, "Экспорт", str(e))
+            self._collector.flush("stats")
+            q_from, q_to = self._period_bounds()
+            previous = previous_period_range(self._current_period, q_from, q_to)
+            stats = self._db.period_stats(q_from, q_to, previous_range=previous)
+        except Exception as exc:
+            LOGGER.warning("Unable to refresh statistics", exc_info=True)
+            self._collector_status.setText("●  Ошибка обновления")
+            self._collector_status.setObjectName("statusError")
+            self._collector_status.setToolTip(str(exc))
+            return
+        self._last_stats = stats
+        self._refresh_dirty = False
+        self._apply_stats(stats)
+        if force_reports or self._stack.currentIndex() == self.PAGE_REPORTS:
+            self._reports.refresh(stats)
+
+    def _apply_stats(self, stats: PeriodStats) -> None:
+        wall_seconds = max(0.0, stats.q_to - stats.q_from)
+        uptime_seconds = stats.estimated_uptime_sec
+        denominator = uptime_seconds if uptime_seconds > 0 else wall_seconds
+        share = (
+            min(100.0, 100.0 * (stats.pc_ms / 1000.0) / denominator)
+            if denominator > 0
+            else 0.0
+        )
+        session = max(0.0, time.time() - float(psutil.boot_time()))
+        self._kpi_labels["active"].setText(format_duration_ms(stats.pc_ms))
+        self._kpi_labels["uptime"].setText(format_duration_seconds(uptime_seconds))
+        self._kpi_labels["share"].setText(f"{share:.1f}%")
+        self._kpi_labels["coverage"].setText(f"{stats.coverage_pct:.1f}%")
+        self._kpi_labels["apps"].setText(str(len(stats.apps)))
+        self._kpi_labels["session"].setText(format_duration_seconds(session))
+        self._session_label.setText(f"Сессия: {format_duration_seconds(session)}")
+        self._collector_status.setText("●  Сбор активен")
+        self._collector_status.setObjectName("statusOk")
+
+        for index, (name, duration, bar) in enumerate(self._top_rows):
+            if index >= len(stats.apps) or stats.pc_ms <= 0:
+                name.setText("—")
+                duration.setText("—")
+                bar.setValue(0)
+                continue
+            app = stats.apps[index]
+            display = friendly_app_name(app.exe_path)
+            name.setText(display)
+            name.setToolTip(display)
+            duration.setText(format_duration_ms(app.active_ms))
+            bar.setValue(max(0, min(1000, int(round(1000 * app.active_ms / stats.pc_ms)))))
+        self._app_model.set_rows(stats.apps, total_ms=stats.pc_ms)
 
     @Slot()
     def _mark_refresh_dirty(self) -> None:
@@ -532,183 +593,229 @@ class MainWindow(QMainWindow):
 
     def _refresh_if_dirty(self) -> None:
         if self._refresh_dirty and self.isVisible():
-            self.refresh_stats()
+            self.refresh_stats(force_reports=self._stack.currentIndex() == self.PAGE_REPORTS)
 
-    def _on_tab_changed(self, _idx: int) -> None:
-        if self._last_stats is not None:
-            self._apply_current_stats(force_reports=True)
+    def _apply_filters(self) -> None:
+        self._app_proxy.set_filter_text(self._filter_search.text())
+        self._app_proxy.set_category(str(self._filter_cat.currentData() or ""))
 
-    @Slot()
-    def refresh_stats(self, *, force_reports: bool = False) -> None:
-        q_from, q_to = self._period_bounds()
-        stats = self._db.period_stats(q_from, q_to)
-        self._last_stats = stats
-        self._refresh_dirty = False
-        self._apply_current_stats(force_reports=force_reports)
-
-    def _filtered_apps(self, stats: PeriodStats) -> list[AppStat]:
-        text = self._filter_search.text().strip().lower()
-        cat_filter = str(self._filter_cat.currentData() or "")
-        out: list[AppStat] = []
-        for app in stats.apps:
-            cat = app.category or self._db.resolve_category(app.exe_path)
-            if cat_filter and cat != cat_filter:
-                continue
-            disp = friendly_app_name(app.exe_path)
-            if text and text not in disp.lower() and text not in app.exe_path.lower():
-                continue
-            out.append(app)
-        return out
-
-    @Slot()
-    def _apply_current_stats(self, *, force_reports: bool = False) -> None:
-        stats = self._last_stats
-        if stats is None:
-            return
-        apps = self._filtered_apps(stats)
-
-        boot = float(psutil.boot_time())
-        session_uptime = max(0.0, time.time() - boot)
-
-        wall_sec = max(0.0, stats.q_to - stats.q_from)
-        pc_uptime_sec = stats.estimated_uptime_sec
-        denom_sec = pc_uptime_sec if pc_uptime_sec > 0 else wall_sec
-
-        share_pct = 0.0
-        if denom_sec > 0 and stats.pc_ms > 0:
-            share_pct = min(100.0, 100.0 * (stats.pc_ms / 1000.0) / denom_sec)
-
-        self._kpi_labels["active"].setText(format_duration_ms(stats.pc_ms))
-        self._kpi_labels["uptime"].setText(format_duration_seconds(pc_uptime_sec))
-        self._kpi_labels["share"].setText(f"{share_pct:.1f}%")
-        self._kpi_labels["coverage"].setText(f"{stats.coverage_pct:.1f}%")
-        self._kpi_labels["apps"].setText(str(len(stats.apps)))
-        self._kpi_labels["session"].setText(format_duration_seconds(session_uptime))
-
-        prev_text = ""
-        prev_range = previous_period_range(self._current_period, stats.q_from, stats.q_to)
-        if prev_range is not None:
-            prev_ms = self._db.total_pc_ms(*prev_range)
-            delta_ms = stats.pc_ms - prev_ms
-            sign = "+" if delta_ms >= 0 else "-"
-            prev_text = f" Сравнение с прошлым периодом: {sign}{format_duration_ms(abs(delta_ms))}."
-
-        self._period_stats.setText(
-            f"Календарная длина периода: {format_duration_seconds(wall_sec)}; "
-            f"оценка времени работы ПК в этом интервале: {format_duration_seconds(pc_uptime_sec)}. "
-            f"Показано приложений: {len(apps)} из {len(stats.apps)}. "
-            f"Покрытие приложениями: {stats.coverage_pct:.1f}%."
-            f"{prev_text}"
-        )
-
-        for i in range(5):
-            name_lbl, bar = self._top5_bars[i]
-            if i < len(stats.apps) and stats.pc_ms > 0:
-                a = stats.apps[i]
-                disp = friendly_app_name(a.exe_path)
-                name_lbl.setText(disp[:56] + ("…" if len(disp) > 56 else ""))
-                pct = min(100, int(round(100.0 * a.active_ms / stats.pc_ms)))
-                bar.setValue(pct)
-                bar.setFormat(f"{format_duration_ms(a.active_ms)}  ({pct}% от активного времени ПК)")
-            else:
-                name_lbl.setText("—")
-                bar.setValue(0)
-                bar.setFormat("—")
-
-        self._fill_apps_table(apps, stats.pc_ms)
-        if force_reports or self._tabs.currentWidget() is self._reports:
-            self._reports.refresh(stats)
-
-    def _fill_apps_table(self, apps: list[AppStat], pc_ms: float) -> None:
-        selected_path = self._selected_app_path()
-        scroll_value = self._table.verticalScrollBar().value()
-        self._table.setSortingEnabled(False)
-        self._table.setRowCount(len(apps))
-        fm = QFontMetrics(self._table.font())
-        path_col_w = self._table.columnWidth(4)
-        elide_w = max(160, path_col_w - 24) if path_col_w > 0 else 420
-
-        for i, a in enumerate(apps):
-            disp = friendly_app_name(a.exe_path)
-            it0 = QTableWidgetItem(disp)
-            it0.setIcon(app_icon_for_exe(a.exe_path))
-            it0.setToolTip(f"{disp}\n{a.exe_path}")
-            it0.setData(Qt.ItemDataRole.UserRole, a.exe_path)
-            self._table.setItem(i, 0, it0)
-
-            cat = a.category or self._db.resolve_category(a.exe_path)
-            it_cat = QTableWidgetItem(CATEGORY_LABELS_RU.get(cat, cat))
-            it_cat.setToolTip(cat)
-            it_cat.setBackground(QBrush(QColor(CATEGORY_COLORS.get(cat, "#94a3b8"))))
-            self._table.setItem(i, 1, it_cat)
-
-            it_active = SortableItem(format_duration_ms(a.active_ms))
-            it_active.setData(Qt.ItemDataRole.UserRole, float(a.active_ms))
-            it_active.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            self._table.setItem(i, 2, it_active)
-
-            pct = 100.0 * a.active_ms / pc_ms if pc_ms > 0 else 0.0
-            it_pct = SortableItem(f"{pct:.1f}%")
-            it_pct.setData(Qt.ItemDataRole.UserRole, pct)
-            it_pct.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            self._table.setItem(i, 3, it_pct)
-
-            path_show = fm.elidedText(
-                a.exe_path, Qt.TextElideMode.ElideMiddle, elide_w
-            )
-            it1 = QTableWidgetItem(path_show)
-            it1.setToolTip(a.exe_path)
-            self._table.setItem(i, 4, it1)
-
-            if selected_path and selected_path == a.exe_path:
-                self._table.selectRow(i)
-        self._table.setSortingEnabled(True)
-        self._table.verticalScrollBar().setValue(scroll_value)
-
-    def _selected_app_path(self) -> str | None:
-        row = self._table.currentRow()
-        if row < 0:
+    def _selected_app(self) -> AppStat | None:
+        indexes = self._table.selectionModel().selectedRows()
+        if not indexes:
             return None
-        it = self._table.item(row, 0)
-        if it is None:
-            return None
-        path = it.data(Qt.ItemDataRole.UserRole)
-        return str(path) if path else None
+        source_index = self._app_proxy.mapToSource(indexes[0])
+        app = self._app_model.row_at(source_index.row())
+        return app if isinstance(app, AppStat) else None
 
-    @Slot()
-    def _create_rule_from_selected_app(self) -> None:
-        path = self._selected_app_path()
-        if not path:
-            return
-        apps = self._last_stats.apps if self._last_stats is not None else []
-        app = next((a for a in apps if a.exe_path == path), None)
+    def _prepare_rule_from_selected_app(self) -> None:
+        app = self._selected_app()
         if app is None:
             return
+        self._selected_rule = None
         self._rule_match.setText(app.exe_name)
         self._rule_kind.setCurrentIndex(self._rule_kind.findData("exact_basename"))
-        idx = self._rule_cat.findData(app.category or OTHER)
-        if idx >= 0:
-            self._rule_cat.setCurrentIndex(idx)
-        self._db.add_category_rule(app.exe_name, "exact_basename", app.category or OTHER)
+        category_index = self._rule_cat.findData(app.category or OTHER)
+        if category_index >= 0:
+            self._rule_cat.setCurrentIndex(category_index)
+        self._set_page(self.PAGE_CATEGORIES)
+        self._rule_match.setFocus()
+
+    def _selected_rule_id(self) -> int | None:
+        row = self._rules_table.currentRow()
+        if row < 0:
+            return self._selected_rule
+        item = self._rules_table.item(row, 0)
+        return int(item.text()) if item is not None else self._selected_rule
+
+    def _refresh_rules_table(self) -> None:
+        rows = self._db.list_category_rules()
+        selected = self._selected_rule_id()
+        self._rules_table.blockSignals(True)
+        self._rules_table.setRowCount(len(rows))
+        selected_row = -1
+        for row_index, rule in enumerate(rows):
+            rule_id = int(rule["id"])
+            values = (
+                str(rule_id),
+                str(rule["priority"]),
+                str(rule["match_text"]),
+                "Точное имя exe" if rule["match_kind"] == "exact_basename" else "Фрагмент пути",
+                CATEGORY_LABELS_RU.get(rule["category"], rule["category"]),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 3:
+                    item.setData(Qt.ItemDataRole.UserRole, rule["match_kind"])
+                if column == 4:
+                    item.setData(Qt.ItemDataRole.UserRole, rule["category"])
+                self._rules_table.setItem(row_index, column, item)
+            if selected == rule_id:
+                selected_row = row_index
+        self._rules_table.blockSignals(False)
+        if selected_row >= 0:
+            self._rules_table.selectRow(selected_row)
+
+    def _load_selected_rule(self) -> None:
+        row = self._rules_table.currentRow()
+        if row < 0:
+            return
+        id_item = self._rules_table.item(row, 0)
+        if id_item is None:
+            return
+        self._selected_rule = int(id_item.text())
+        self._rule_match.setText(self._rules_table.item(row, 2).text())
+        kind = self._rules_table.item(row, 3).data(Qt.ItemDataRole.UserRole)
+        category = self._rules_table.item(row, 4).data(Qt.ItemDataRole.UserRole)
+        self._rule_kind.setCurrentIndex(self._rule_kind.findData(kind))
+        self._rule_cat.setCurrentIndex(self._rule_cat.findData(category))
+
+    def _rule_values(self) -> tuple[str, str, str] | None:
+        text = self._rule_match.text().strip()
+        kind = str(self._rule_kind.currentData() or "")
+        category = str(self._rule_cat.currentData() or "")
+        if not text or not kind or not category:
+            QMessageBox.warning(self, "Правило", "Заполните шаблон, тип и категорию.")
+            return None
+        return text, kind, category
+
+    def _add_category_rule(self) -> None:
+        values = self._rule_values()
+        if values is None:
+            return
+        text, kind, category = values
+        for rule in self._db.list_category_rules():
+            if rule["match_kind"] == kind and str(rule["match_text"]).casefold() == text.casefold():
+                QMessageBox.information(self, "Правило", "Такое правило уже существует.")
+                return
+        self._selected_rule = self._db.add_category_rule(text, kind, category)
         self._refresh_rules_table()
-        self.refresh_stats(force_reports=True)
-        self._tabs.setCurrentWidget(self._tabs.widget(2))
+        self.refresh_stats()
+
+    def _save_category_rule(self) -> None:
+        rule_id = self._selected_rule_id()
+        values = self._rule_values()
+        if rule_id is None or values is None:
+            return
+        text, kind, category = values
+        self._db.update_category_rule(rule_id, text, kind, category)
+        self._selected_rule = rule_id
+        self._refresh_rules_table()
+        self.refresh_stats()
+
+    def _delete_category_rule(self) -> None:
+        rule_id = self._selected_rule_id()
+        if rule_id is None:
+            return
+        self._db.delete_category_rule(rule_id)
+        self._selected_rule = None
+        self._refresh_rules_table()
+        self.refresh_stats()
+
+    def _move_category_rule(self, direction: int) -> None:
+        rule_id = self._selected_rule_id()
+        if rule_id is None:
+            return
+        self._db.move_category_rule(rule_id, direction)
+        self._selected_rule = rule_id
+        self._refresh_rules_table()
+        self.refresh_stats()
+
+    @Slot()
+    def _save_autostart(self) -> None:
+        enabled = self._autostart_cb.isChecked()
+        if autostart.set_enabled(enabled):
+            self._db.set_autostart_enabled(enabled)
+            return
+        self._autostart_cb.blockSignals(True)
+        self._autostart_cb.setChecked(not enabled)
+        self._autostart_cb.blockSignals(False)
+        QMessageBox.warning(self, "Автозапуск", "Windows не разрешила изменить автозапуск.")
+
+    def _save_afk(self) -> None:
+        self._db.set_afk_seconds(float(self._afk.value()))
+        self._collector.reload_settings()
+
+    def _save_excluded(self) -> None:
+        values = {
+            part.strip().lower()
+            for part in self._excluded.text().replace(";", ",").split(",")
+            if part.strip()
+        }
+        self._db.set_excluded_exes(values)
+        self._collector.reload_settings()
+
+    def _on_theme_changed(self) -> None:
+        mode = str(self._theme_combo.currentData() or "system")
+        self._db.set_setting("ui_theme", mode)
+        self.theme_changed.emit(mode)
+
+    def apply_theme(self, resolved_theme: str) -> None:
+        self._reports.apply_chart_theme(resolved_theme)
+
+    def _export_csv(self) -> None:
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Сохранить отчёт CSV", "", "CSV (*.csv);;Все файлы (*.*)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            self._collector.flush("export")
+            q_from, q_to = self._period_bounds()
+            stats = self._db.period_stats(
+                q_from,
+                q_to,
+                previous_range=previous_period_range(self._current_period, q_from, q_to),
+            )
+            export_apps_csv(self._db, q_from, q_to, path, stats)
+        except (OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Экспорт", str(exc))
+
+    def _reflow_kpis(self, columns: int) -> None:
+        if self._kpi_columns == columns:
+            return
+        self._kpi_columns = columns
+        for index, frame in enumerate(self._kpi_frames):
+            self._kpi_grid.addWidget(frame, index // columns, index % columns)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_kpi_grid"):
+            self._reflow_kpis(6 if self.width() >= 1320 else 3)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if self._refresh_dirty:
+            QTimer.singleShot(0, self.refresh_stats)
+
+    def _save_window_state(self) -> None:
+        geometry = base64.b64encode(bytes(self.saveGeometry())).decode("ascii")
+        self._db.set_setting("ui_geometry", geometry)
+        self._db.set_setting("ui_page", str(self._stack.currentIndex()))
+        self._db.set_setting("ui_period", self._current_period)
+
+    def _restore_window_state(self) -> None:
+        encoded = self._db.get_setting("ui_geometry", "") or ""
+        if not encoded:
+            return
+        try:
+            self.restoreGeometry(QByteArray.fromBase64(encoded.encode("ascii")))
+        except (ValueError, TypeError):
+            pass
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._save_window_state()
         close_to_tray = (self._db.get_setting("close_to_tray", "1") or "1") == "1"
         if self._tray_available and close_to_tray:
-            event.ignore()
             if (self._db.get_setting("first_close_to_tray_notice_seen", "0") or "0") != "1":
                 self._db.set_setting("first_close_to_tray_notice_seen", "1")
                 QMessageBox.information(
                     self,
                     "PC Stat",
-                    "Окно скрыто, трекер продолжает работать в области уведомлений.",
+                    "Окно будет закрыто, а сбор продолжится в области уведомлений.",
                 )
-            self.hide()
+            event.accept()
+            self.close_to_tray_requested.emit()
             return
         event.accept()

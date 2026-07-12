@@ -1,18 +1,7 @@
-# Создаёт GitHub Release и прикрепляет один .exe (нужен GitHub CLI: gh).
-# Установка: https://cli.github.com/
-# Авторизация: gh auth login
-#
-# Пример (один файл PCStat.exe после build_windows.ps1 -OneFile):
-#   .\scripts\publish_release.ps1 -Tag "v1.0.0" -Title "PC Stat 1.0.0"
-#
-# Пример (установщик после build_installer.ps1):
-#   .\scripts\publish_release.ps1 -Tag "v1.0.0" -UseInstaller
+# Publishes the portable one-file executable and its SHA-256 checksum.
 
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Tag,
     [string]$Title = "",
-    [switch]$UseInstaller,
     [string]$Notes = ""
 )
 
@@ -20,50 +9,46 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $root
 
-$gh = Get-Command gh -ErrorAction SilentlyContinue
-if (-not $gh) {
-    Write-Error "Не найден gh. Установите GitHub CLI (https://cli.github.com/) и выполните: gh auth login"
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    Write-Error "GitHub CLI (gh) was not found. Install it and run: gh auth login"
 }
 
-if ($UseInstaller) {
-    $assetPath = Join-Path $root "installer\output\PCStat-Setup.exe"
-} else {
-    $assetPath = Join-Path $root "dist\PCStat.exe"
+$version = (& python (Join-Path $PSScriptRoot "generate_version_metadata.py") --print-version).Trim()
+if (-not $version) {
+    Write-Error "Could not read APP_VERSION from pc_stat_win\version.py."
 }
+$tag = "v$version"
+$assetPath = Join-Path $root "dist\PCStat.exe"
+$checksumPath = Join-Path $root "dist\SHA256SUMS.txt"
 
 if (-not (Test-Path -LiteralPath $assetPath)) {
-    Write-Error "Файл не найден: $assetPath. Соберите проект: build_windows.ps1 -OneFile или build_installer.ps1"
+    Write-Error "Missing dist\PCStat.exe. Run: .\scripts\build_windows.ps1 -OneFile"
 }
+
+$hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+Set-Content -LiteralPath $checksumPath -Value "$hash  PCStat.exe" -Encoding ascii
 
 if (-not $Title) {
-    $Title = "Release $Tag"
+    $Title = "PC Stat $version"
 }
 
-$relArgs = @(
-    "release", "create", $Tag,
+$releaseArgs = @(
+    "release", "create", $tag,
     $assetPath,
+    $checksumPath,
     "--title", $Title,
     "--latest"
 )
 if ($Notes) {
-    $relArgs += "--notes"
-    $relArgs += $Notes
+    $releaseArgs += @("--notes", $Notes)
 } else {
-    $relArgs += "--generate-notes"
+    $releaseArgs += "--generate-notes"
 }
 
-Write-Host "gh $($relArgs -join ' ')"
-& gh @relArgs
+Write-Host "Publishing $tag with PCStat.exe and SHA256SUMS.txt"
+& gh @releaseArgs
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$releasesUrl = "https://github.com/kooal-111/pc_stat_WIN/releases"
-try {
-    $origin = git remote get-url origin 2>$null
-    if ($origin -match "github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$") {
-        $releasesUrl = "https://github.com/$($Matches[1])/$($Matches[2])/releases"
-    }
-} catch {}
-Write-Host ""
-Write-Host "Готово. Релизы: $releasesUrl"
+Write-Host "Published $tag"

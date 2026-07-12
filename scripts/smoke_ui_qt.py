@@ -1,4 +1,4 @@
-"""Qt smoke: create MainWindow, processEvents, exit (CI / local sanity)."""
+"""Offscreen UI smoke for pages, themes and compact desktop geometry."""
 from __future__ import annotations
 
 import os
@@ -19,25 +19,35 @@ from pc_stat_win.collector import UsageCollector
 from pc_stat_win.config import POLL_INTERVAL_MS
 from pc_stat_win.db import Database
 from pc_stat_win.ui.main_window import MainWindow
-from pc_stat_win.ui.styles import load_stylesheet
+from pc_stat_win.ui.theme_manager import ThemeManager
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     with tempfile.TemporaryDirectory(prefix="pc_stat_smoke_") as tmp:
-        db_path = Path(tmp) / "data.sqlite"
-        db = Database(db_path)
-        theme = db.get_setting("ui_theme", "dark") or "dark"
-        if theme not in ("dark", "light"):
-            theme = "dark"
-        app.setStyleSheet(load_stylesheet(theme))
-        icon = app_icon()
-        col = UsageCollector(db, poll_interval_ms=POLL_INTERVAL_MS)
-        win = MainWindow(db, col, window_icon=icon, tray_available=False)
-        win.show()
-        app.processEvents()
-        win.close()
-        col.stop()
+        db = Database(Path(tmp) / "data.sqlite")
+        collector = UsageCollector(db, poll_interval_ms=POLL_INTERVAL_MS)
+        themes = ThemeManager(app, "system")
+        window = MainWindow(db, collector, window_icon=app_icon(), tray_available=False)
+        themes.register_window(window)
+        themes.theme_changed.connect(window.apply_theme)
+        window.theme_changed.connect(themes.set_mode)
+
+        for width, height in ((920, 640), (1280, 800)):
+            window.resize(width, height)
+            window.show()
+            app.processEvents()
+            for mode in ("dark", "light", "system"):
+                themes.set_mode(mode)
+                app.processEvents()
+                for page in range(window._stack.count()):
+                    window._set_page(page)
+                    app.processEvents()
+                    if window._stack.currentWidget().width() <= 0:
+                        raise AssertionError(f"page {page} has invalid geometry")
+
+        window.close()
+        collector.stop()
         db.close()
     return 0
 

@@ -12,11 +12,14 @@ except NameError:
 
 _assets = _ROOT / "pc_stat_win" / "assets"
 _icon = _assets / "app.ico"
+_version_info = _ROOT / "build" / "PCStat_version_info.txt"
 _with_qtcharts = os.environ.get("PCSTAT_WITH_QTCHARTS", "1") != "0"
 
+if not _version_info.is_file():
+    raise SystemExit("Missing build/PCStat_version_info.txt; run scripts/build_windows.ps1")
+
 _datas = [
-    (str(_ROOT / "pc_stat_win" / "ui" / "theme_dark.qss"), "pc_stat_win/ui"),
-    (str(_ROOT / "pc_stat_win" / "ui" / "theme_light.qss"), "pc_stat_win/ui"),
+    (str(_ROOT / "pc_stat_win" / "ui" / "theme.qss"), "pc_stat_win/ui"),
     (str(_assets), "pc_stat_win/assets"),
 ]
 
@@ -66,5 +69,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(_icon),
-    version=str(_ROOT / "pc_stat_win" / "version_info.txt"),
+    version=str(_version_info),
 )

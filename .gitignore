@@ -21,6 +21,10 @@ PC Stat/
 installer/output/
 *.spec.bak
 
+# Portable binaries are published as GitHub Release assets, not tracked here
+download/PCStat.exe
+download/SHA256SUMS.txt
+
 # IDE / OS
 .idea/
 .vscode/

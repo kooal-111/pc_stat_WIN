@@ -2,7 +2,9 @@
 ; Запуск: ISCC.exe PCStat.iss из каталога installer (или через scripts\build_installer.ps1).
 
 #define MyAppName "PC Stat"
-#define MyAppVersion "1.1.0"
+#ifndef MyAppVersion
+  #error MyAppVersion must be supplied by scripts\build_installer.ps1
+#endif
 #define MyAppPublisher "PC Stat"
 #define MyAppExeName "PCStat.exe"
 ; Стабильный AppId — не менять между выпусками, чтобы «обновление» видело ту же программу.

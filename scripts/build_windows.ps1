@@ -11,6 +11,7 @@ Set-Location (Join-Path $PSScriptRoot "..")
 python -m pip install -r requirements.txt -r requirements-build.txt
 
 python -c "from pc_stat_win.branding import write_packaged_icon_assets; p=write_packaged_icon_assets(); print('Icons:', p[0], p[1])"
+python scripts\generate_version_metadata.py
 
 if ($NoQtCharts) {
     $env:PCSTAT_WITH_QTCHARTS = "0"

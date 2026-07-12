@@ -48,7 +48,7 @@ git push origin main
 
 Результат: `dist\PCStat.exe`.
 
-**Установщик (рекомендуется пользователям):** нужен [Inno Setup 6](https://jrsoftware.org/isinfo.php), затем:
+**Локальный установщик (альтернатива):** нужен [Inno Setup 6](https://jrsoftware.org/isinfo.php), затем:
 
 ```powershell
 .\scripts\build_installer.ps1
@@ -56,23 +56,23 @@ git push origin main
 
 Результат: `installer\output\PCStat-Setup.exe`.
 
-**Копия для пользователей в репозитории:** после onefile-сборки выполните `.\scripts\sync_download_exe.ps1` — в папку **`download/`** попадёт актуальный `PCStat.exe`, его и коммитят (см. README). Каталоги **`build/`** и **`dist/`** по-прежнему в `.gitignore`.
+Готовый `PCStat.exe` не коммитится в `download/`: portable-сборка публикуется как GitHub Release asset. Каталоги `build/`, `dist/` и файл `download/PCStat.exe` находятся в `.gitignore`.
 
-## GitHub Releases (по желанию)
+## GitHub Releases
 
-Дополнительно к папке `download/` можно выкладывать тот же файл как вложение релиза.
+Релиз содержит portable `PCStat.exe` и `SHA256SUMS.txt`.
 
-1. Соберите `dist\PCStat.exe` или `installer\output\PCStat-Setup.exe`.
+1. Соберите `dist\PCStat.exe` командой `.\scripts\build_windows.ps1 -OneFile`.
 2. Установите [GitHub CLI](https://cli.github.com/) и выполните `gh auth login`.
 3. Создайте релиз:
 
 ```powershell
-.\scripts\publish_release.ps1 -Tag "v1.0.0" -Title "PC Stat 1.0.0"
+.\scripts\publish_release.ps1
 ```
 
-Для установщика добавьте `-UseInstaller`.
+Скрипт читает `APP_VERSION` из `pc_stat_win/version.py`, формирует тег `v<APP_VERSION>`, создаёт checksum и публикует оба portable-файла.
 
-**Вручную:** на сайте GitHub → репозиторий → **Releases** → **Draft a new release** → тег `v1.0.0` → прикрепите файл в **Attach binaries** → **Publish release**.
+**Вручную:** на сайте GitHub → репозиторий → **Releases** → **Draft a new release** → тег версии → прикрепите `PCStat.exe` и `SHA256SUMS.txt` → **Publish release**.
 
 Ссылка «последняя версия»:
 

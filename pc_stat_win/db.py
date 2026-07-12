@@ -16,7 +16,7 @@ from pc_stat_win.categories import (
     resolve_default_category,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _CATEGORY_CHECK_SQL = ",".join(f"'{k}'" for k in ALL_CATEGORY_KEYS)
 
 
@@ -39,6 +39,32 @@ class AppStat:
     window_title: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class BufferedInterval:
+    kind: str
+    start_ts: float
+    end_ts: float
+    duration_ms: int
+    exe_path: str | None = None
+    exe_name: str | None = None
+    window_title: str | None = None
+    row_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Persisted:
+    pc_row_id: int | None
+    app_row_id: int | None
+
+    @property
+    def pc_id(self) -> int | None:
+        return self.pc_row_id
+
+    @property
+    def app_id(self) -> int | None:
+        return self.app_row_id
+
+
 @dataclass(slots=True)
 class PeriodStats:
     q_from: float
@@ -49,6 +75,7 @@ class PeriodStats:
     chart_mode: str
     chart_series: list[tuple[str, float]]
     estimated_uptime_sec: float
+    previous_pc_ms: float | None = None
 
     @property
     def app_ms(self) -> float:
@@ -65,10 +92,14 @@ class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._conn = sqlite3.connect(str(path))
         self._conn.row_factory = sqlite3.Row
         self._category_rules_cache: list[sqlite3.Row] | None = None
-        self._init_schema()
+        try:
+            self._init_schema()
+        except Exception:
+            self._conn.close()
+            raise
 
     def close(self) -> None:
         self._conn.close()
@@ -76,6 +107,7 @@ class Database:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
             conn.commit()
@@ -88,6 +120,7 @@ class Database:
             f"""
             PRAGMA busy_timeout = 5000;
             PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS meta (
@@ -105,14 +138,6 @@ class Database:
               end_ts REAL NOT NULL,
               duration_ms INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_intervals_kind_time ON intervals (kind, start_ts, end_ts);
-            CREATE INDEX IF NOT EXISTS idx_intervals_pc_overlap
-              ON intervals (start_ts, end_ts, duration_ms)
-              WHERE kind = 'pc_active';
-            CREATE INDEX IF NOT EXISTS idx_intervals_app_overlap
-              ON intervals (start_ts, end_ts, exe_path, exe_name, duration_ms)
-              WHERE kind = 'app';
-
             CREATE TABLE IF NOT EXISTS boot_log (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               boot_ts REAL NOT NULL,
@@ -234,6 +259,64 @@ class Database:
         )
         if commit:
             self._conn.commit()
+
+    def persist_usage(
+        self,
+        pc: BufferedInterval | None = None,
+        app: BufferedInterval | None = None,
+    ) -> Persisted:
+        """Insert or update buffered PC/app intervals in one transaction."""
+        persisted: dict[str, int | None] = {"pc_active": None, "app": None}
+        with self.transaction() as conn:
+            for expected_kind, interval in (("pc_active", pc), ("app", app)):
+                if interval is None:
+                    continue
+                if interval.kind != expected_kind:
+                    raise ValueError(
+                        f"expected {expected_kind!r} interval, got {interval.kind!r}"
+                    )
+                if interval.duration_ms <= 0 or interval.end_ts <= interval.start_ts:
+                    raise ValueError("interval must have positive duration and wall-clock span")
+                if interval.row_id is None:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO intervals (
+                          kind, exe_path, exe_name, window_title,
+                          start_ts, end_ts, duration_ms
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            interval.kind,
+                            interval.exe_path,
+                            interval.exe_name,
+                            interval.window_title,
+                            interval.start_ts,
+                            interval.end_ts,
+                            interval.duration_ms,
+                        ),
+                    )
+                    persisted[expected_kind] = int(cur.lastrowid)
+                else:
+                    cur = conn.execute(
+                        """
+                        UPDATE intervals
+                        SET end_ts = ?, duration_ms = ?
+                        WHERE id = ? AND kind = ?
+                        """,
+                        (
+                            interval.end_ts,
+                            interval.duration_ms,
+                            interval.row_id,
+                            interval.kind,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise LookupError(f"interval row {interval.row_id} no longer exists")
+                    persisted[expected_kind] = interval.row_id
+        return Persisted(
+            pc_row_id=persisted["pc_active"],
+            app_row_id=persisted["app"],
+        )
 
     def log_boot_if_new(self, boot_ts: float) -> None:
         last = self._conn.execute(
@@ -421,6 +504,25 @@ class Database:
                 self.set_setting("autostart_enabled", "0")
             self.set_setting("schema_version", "5")
             ver = 5
+        if ver < 6:
+            self._migrate_v5_to_v6()
+            ver = 6
+
+    def _migrate_v5_to_v6(self) -> None:
+        with self.transaction() as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_intervals_kind_time")
+            conn.execute("DROP INDEX IF EXISTS idx_intervals_pc_overlap")
+            conn.execute("DROP INDEX IF EXISTS idx_intervals_app_overlap")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intervals_kind_start "
+                "ON intervals (kind, start_ts)"
+            )
+            conn.execute(
+                """
+                INSERT INTO meta (key, value) VALUES ('schema_version', '6')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
+            )
 
     # --- app categories ---
     def _invalidate_category_rules(self) -> None:
@@ -585,16 +687,25 @@ class Database:
               AND end_ts > ?
               AND end_ts > start_ts
               AND duration_ms > 0
+            ORDER BY start_ts
             """,
             (q_to, q_from),
-        ).fetchall()
+        )
+        slot_i = 0
         for row in rows:
             start = float(row["start_ts"])
             end = float(row["end_ts"])
             duration = int(row["duration_ms"])
-            for i, (_label, slot_start, slot_end) in enumerate(slots):
+            while slot_i < len(slots) and slots[slot_i][2] <= start:
+                slot_i += 1
+            i = slot_i
+            while i < len(slots) and slots[i][1] < end:
+                _label, slot_start, slot_end = slots[i]
                 if slot_end > slot_start:
-                    totals[i] += _overlap_ms(start, end, duration, slot_start, slot_end)
+                    totals[i] += _overlap_ms(
+                        start, end, duration, slot_start, slot_end
+                    )
+                i += 1
         return [(label, totals[i]) for i, (label, _a, _b) in enumerate(slots)]
 
     def chart_pc_active_series(
@@ -608,8 +719,18 @@ class Database:
             return "hour", self.bucket_pc_active_by_hour_slots(q_from, q_to)
         return "day", self.bucket_pc_active_by_calendar_day(q_from, q_to)
 
-    def period_stats(self, q_from: float, q_to: float) -> PeriodStats:
+    def period_stats(
+        self,
+        q_from: float,
+        q_to: float,
+        previous_range: tuple[float, float] | None = None,
+    ) -> PeriodStats:
         pc_ms = self.total_pc_ms(q_from, q_to)
+        previous_pc_ms: float | None = None
+        if previous_range is not None:
+            previous_from, previous_to = previous_range
+            if previous_to > previous_from:
+                previous_pc_ms = self.total_pc_ms(previous_from, previous_to)
         apps = self.totals_by_app(q_from, q_to)
         by_category = {k: 0.0 for k in ALL_CATEGORY_KEYS}
         for app in apps:
@@ -625,6 +746,7 @@ class Database:
             chart_mode=chart_mode,
             chart_series=chart_series,
             estimated_uptime_sec=self.estimated_pc_uptime_seconds(q_from, q_to),
+            previous_pc_ms=previous_pc_ms,
         )
 
     def optimize(self) -> None:

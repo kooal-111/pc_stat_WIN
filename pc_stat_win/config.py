@@ -15,6 +15,9 @@ APP_DIR_NAME = "pc_stat_win"
 DEFAULT_AFK_SECONDS = 120.0
 POLL_INTERVAL_MS = 2000
 MAX_TICK_INTERVAL_MS = 15000
+COLLECTOR_FLUSH_INTERVAL_SECONDS = 30.0
+FOREGROUND_CACHE_TTL_SECONDS = 5.0
+FOREGROUND_CACHE_MAX_SIZE = 256
 UI_REFRESH_INTERVAL_MS = 10000
 
 # Foreground exe basename — usually not focused for user work; still filter conservative
@@ -47,6 +50,9 @@ SYSTEM32_SILENT_EXES = frozenset(
 
 
 def default_db_path() -> Path:
+    override = os.environ.get("PCSTAT_DB_PATH")
+    if override:
+        return Path(override).expanduser()
     return _local_app_data() / APP_DIR_NAME / "data.sqlite"
 
 

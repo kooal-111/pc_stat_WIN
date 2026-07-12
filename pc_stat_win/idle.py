@@ -11,12 +11,15 @@ class LASTINPUTINFO(ctypes.Structure):
     ]
 
 
-def idle_seconds() -> float:
+def idle_seconds() -> float | None:
     """Seconds since last keyboard or mouse input (same tick domain as GetTickCount)."""
     lii = LASTINPUTINFO()
     lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-        return 0.0
-    tick_now = ctypes.windll.kernel32.GetTickCount()
+    try:
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            return None
+        tick_now = ctypes.windll.kernel32.GetTickCount()
+    except (AttributeError, OSError):
+        return None
     idle_ms = (tick_now - lii.dwTime) & 0xFFFFFFFF
     return idle_ms / 1000.0

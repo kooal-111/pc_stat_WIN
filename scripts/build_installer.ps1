@@ -35,8 +35,12 @@ if (-not $iscc) {
 }
 
 $iss = Join-Path $root "installer\PCStat.iss"
-Write-Host "Running: $iscc `"$iss`""
-& $iscc $iss
+$version = (& python (Join-Path $PSScriptRoot "generate_version_metadata.py") --print-version).Trim()
+if (-not $version) {
+    Write-Error "Could not read APP_VERSION from pc_stat_win\version.py."
+}
+Write-Host "Running Inno Setup for PC Stat $version"
+& $iscc "/DMyAppVersion=$version" $iss
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
