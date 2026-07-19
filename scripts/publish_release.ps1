@@ -172,12 +172,14 @@ try {
         throw "Release gates changed the Git checkout; refusing to tag or publish.`n$postBuildStatus"
     }
 
-    $tagExists = $true
-    $tagType = & git cat-file -t $tag 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        $tagExists = $false
+    & git show-ref --verify --quiet "refs/tags/$tag"
+    $tagLookupExitCode = $LASTEXITCODE
+    if ($tagLookupExitCode -notin 0, 1) {
+        throw "Unable to determine whether local tag $tag exists."
     }
+    $tagExists = $tagLookupExitCode -eq 0
     if ($tagExists) {
+        $tagType = Get-CheckedOutput "git" @("cat-file", "-t", $tag)
         if (($tagType | Out-String).Trim() -ne "tag") {
             throw "$tag exists locally but is not an annotated tag."
         }
