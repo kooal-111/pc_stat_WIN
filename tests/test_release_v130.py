@@ -100,7 +100,7 @@ class ReleaseV130Tests(unittest.TestCase):
             ".ProductVersion",
             '"tag", "-a", $tag, $headSha',
             'show-ref --verify --quiet "refs/tags/$tag"',
-            '"push", $Remote, "refs/tags/$tag:refs/tags/$tag"',
+            '"push", $Remote, "refs/tags/${tag}:refs/tags/${tag}"',
             '"ls-remote", "--exit-code", "--tags"',
             '"--verify-tag"',
             '"--target", $headSha',

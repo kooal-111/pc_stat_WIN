@@ -191,7 +191,7 @@ try {
         Invoke-Checked "git" @("tag", "-a", $tag, $headSha, "-m", "PC Stat $version")
     }
 
-    Invoke-Checked "git" @("push", $Remote, "refs/tags/$tag:refs/tags/$tag")
+    Invoke-Checked "git" @("push", $Remote, "refs/tags/${tag}:refs/tags/${tag}")
     $remoteTag = Get-CheckedOutput "git" @("ls-remote", "--exit-code", "--tags", $Remote, "refs/tags/$tag^{}")
     $remoteCommit = ($remoteTag -split "\s+")[0]
     if ($remoteCommit -ne $headSha) {
