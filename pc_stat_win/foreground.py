@@ -22,7 +22,8 @@ class ForegroundInfo:
 
 
 _ProcessIdentity = tuple[str, str]
-_PROCESS_CACHE: OrderedDict[int, tuple[float, _ProcessIdentity]] = OrderedDict()
+_ProcessKey = tuple[int, int]
+_PROCESS_CACHE: OrderedDict[_ProcessKey, tuple[float, _ProcessIdentity]] = OrderedDict()
 
 
 def _norm_path(p: str) -> str:
@@ -32,14 +33,16 @@ def _norm_path(p: str) -> str:
         return p
 
 
-def _process_identity(pid: int, now: float) -> _ProcessIdentity | None:
-    cached = _PROCESS_CACHE.get(pid)
+def _process_identity(pid: int, hwnd: int, now: float) -> _ProcessIdentity | None:
+    # A foreground HWND changes when Windows reuses a recently exited PID.
+    key = (pid, hwnd)
+    cached = _PROCESS_CACHE.get(key)
     if cached is not None:
         expires_at, identity = cached
         if expires_at > now:
-            _PROCESS_CACHE.move_to_end(pid)
+            _PROCESS_CACHE.move_to_end(key)
             return identity
-        del _PROCESS_CACHE[pid]
+        del _PROCESS_CACHE[key]
 
     try:
         exe = psutil.Process(pid).exe()
@@ -48,8 +51,8 @@ def _process_identity(pid: int, now: float) -> _ProcessIdentity | None:
 
     exe_path = _norm_path(exe)
     identity = (exe_path, os.path.basename(exe_path).lower())
-    _PROCESS_CACHE[pid] = (now + FOREGROUND_CACHE_TTL_SECONDS, identity)
-    _PROCESS_CACHE.move_to_end(pid)
+    _PROCESS_CACHE[key] = (now + FOREGROUND_CACHE_TTL_SECONDS, identity)
+    _PROCESS_CACHE.move_to_end(key)
     while len(_PROCESS_CACHE) > FOREGROUND_CACHE_MAX_SIZE:
         _PROCESS_CACHE.popitem(last=False)
     return identity
@@ -71,8 +74,8 @@ def get_foreground_app(*, monotonic_clock=time.monotonic) -> ForegroundInfo | No
     try:
         title = win32gui.GetWindowText(hwnd) or ""
     except win32gui.error:
-        return None
-    identity = _process_identity(int(pid), monotonic_clock())
+        title = ""
+    identity = _process_identity(int(pid), int(hwnd), monotonic_clock())
     if identity is None:
         return None
     exe_path, exe_name = identity

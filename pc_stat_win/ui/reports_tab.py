@@ -3,13 +3,15 @@ from __future__ import annotations
 from math import ceil
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QBrush, QColor, QPainter, QPen
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QResizeEvent
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -79,17 +81,19 @@ class ReportsTab(QWidget):
 
         inner = QWidget()
         inner.setObjectName("pageContent")
+        inner.setMinimumWidth(0)
+        inner.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(4, 4, 8, 16)
         layout.setSpacing(12)
 
         overview = QFrame()
         overview.setObjectName("glassSurface")
-        overview_layout = QHBoxLayout(overview)
-        overview_layout.setContentsMargins(16, 14, 16, 14)
-        self._active_value = self._metric(overview_layout, "Активное время")
-        self._coverage_value = self._metric(overview_layout, "Покрытие приложениями")
-        self._comparison_value = self._metric(overview_layout, "К прошлому периоду")
+        self._overview_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, overview)
+        self._overview_layout.setContentsMargins(16, 14, 16, 14)
+        self._active_value = self._metric(self._overview_layout, "Активное время")
+        self._coverage_value = self._metric(self._overview_layout, "Покрытие приложениями")
+        self._comparison_value = self._metric(self._overview_layout, "К прошлому периоду")
         layout.addWidget(overview)
 
         categories = QFrame()
@@ -111,8 +115,8 @@ class ReportsTab(QWidget):
             self._category_rows[category] = item
         layout.addWidget(categories)
 
-        lists = QHBoxLayout()
-        lists.setSpacing(12)
+        self._lists_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._lists_layout.setSpacing(12)
         top_surface = QFrame()
         top_surface.setObjectName("glassSurface")
         top_layout = QVBoxLayout(top_surface)
@@ -122,9 +126,11 @@ class ReportsTab(QWidget):
         top_layout.addWidget(top_title)
         self._top_apps = QLabel()
         self._top_apps.setWordWrap(True)
+        self._top_apps.setMinimumWidth(0)
+        self._top_apps.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._top_apps.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         top_layout.addWidget(self._top_apps)
-        lists.addWidget(top_surface, 1)
+        self._lists_layout.addWidget(top_surface, 1)
 
         other_surface = QFrame()
         other_surface.setObjectName("glassSurface")
@@ -135,10 +141,12 @@ class ReportsTab(QWidget):
         other_layout.addWidget(other_title)
         self._other_apps = QLabel()
         self._other_apps.setWordWrap(True)
+        self._other_apps.setMinimumWidth(0)
+        self._other_apps.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._other_apps.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         other_layout.addWidget(self._other_apps)
-        lists.addWidget(other_surface, 1)
-        layout.addLayout(lists)
+        self._lists_layout.addWidget(other_surface, 1)
+        layout.addLayout(self._lists_layout)
 
         timeline = QFrame()
         timeline.setObjectName("glassSurface")
@@ -148,6 +156,8 @@ class ReportsTab(QWidget):
         timeline_title.setObjectName("sectionTitle")
         timeline_layout.addWidget(timeline_title)
         self._chart_host = QWidget()
+        self._chart_host.setMinimumWidth(0)
+        self._chart_host.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._chart_layout = QVBoxLayout(self._chart_host)
         self._chart_layout.setContentsMargins(0, 0, 0, 0)
         self._chart_placeholder = QLabel("График появится при открытии отчёта")
@@ -163,9 +173,10 @@ class ReportsTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
+        self._apply_responsive_layout()
 
     @staticmethod
-    def _metric(layout: QHBoxLayout, label: str) -> QLabel:
+    def _metric(layout: QBoxLayout, label: str) -> QLabel:
         block = QWidget()
         block_layout = QVBoxLayout(block)
         block_layout.setContentsMargins(0, 0, 0, 0)
@@ -178,10 +189,21 @@ class ReportsTab(QWidget):
         layout.addWidget(block, 1)
         return value
 
+    def _apply_responsive_layout(self) -> None:
+        direction = (
+            QBoxLayout.Direction.TopToBottom
+            if self.width() < 860
+            else QBoxLayout.Direction.LeftToRight
+        )
+        self._overview_layout.setDirection(direction)
+        self._lists_layout.setDirection(direction)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._apply_responsive_layout()
+
     def set_active(self, active: bool) -> None:
         self._active = active
-        if active and self._stats is not None:
-            self._refresh_chart()
 
     def apply_chart_theme(self, theme_key: str) -> None:
         self._theme_key = theme_key
@@ -251,8 +273,14 @@ class ReportsTab(QWidget):
 
         self._chart = QChart()
         self._chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
+        self._chart.setBackgroundVisible(False)
+        self._chart.setPlotAreaBackgroundVisible(False)
+        self._chart.legend().hide()
         self._chart_view = QChartView(self._chart)
         self._chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._chart_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._chart_view.setMinimumWidth(0)
+        self._chart_view.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._chart_view.setMinimumHeight(280)
         self._chart_layout.removeWidget(self._chart_placeholder)
         self._chart_placeholder.deleteLater()
@@ -264,13 +292,13 @@ class ReportsTab(QWidget):
     def _apply_chart_palette(self) -> None:
         if not self._chart_ready:
             return
-        background = QColor("#f8fafc") if self._theme_key == "light" else QColor("#171b22")
-        plot = QColor("#eef2f7") if self._theme_key == "light" else QColor("#11151b")
-        self._chart.setBackgroundBrush(QBrush(background))
-        self._chart.setPlotAreaBackgroundVisible(True)
-        self._chart.setPlotAreaBackgroundBrush(QBrush(plot))
+        transparent = QColor(0, 0, 0, 0)
+        self._chart.setBackgroundVisible(False)
+        self._chart.setBackgroundBrush(QBrush(transparent))
+        self._chart.setPlotAreaBackgroundVisible(False)
+        self._chart.setPlotAreaBackgroundBrush(QBrush(transparent))
         self._chart.setTitleBrush(QBrush(self._text_color))
-        self._chart.legend().setLabelBrush(QBrush(self._text_color))
+        self._chart.legend().hide()
         for axis in self._chart.axes():
             axis.setLabelsBrush(QBrush(self._text_color))
             if hasattr(axis, "setTitleBrush"):
@@ -307,6 +335,7 @@ class ReportsTab(QWidget):
         bars = QBarSeries()
         bars.append(values)
         self._chart.addSeries(bars)
+        self._chart.legend().hide()
         self._chart.setTitle(
             "Активность по часам" if stats.chart_mode == "hour" else "Активность по дням"
         )

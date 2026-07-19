@@ -7,7 +7,7 @@ from types import MappingProxyType
 from typing import Literal, Mapping, cast
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication, QPalette, QStyleHints
+from PySide6.QtGui import QColor, QGuiApplication, QPalette, QStyleHints
 
 ThemeMode = Literal["system", "light", "dark"]
 ResolvedTheme = Literal["light", "dark"]
@@ -36,6 +36,7 @@ _LIGHT = {
     "accent_pressed": "#1E40AF",
     "accent_text": "#FFFFFF",
     "danger": "#DC2626",
+    "success": "#137333",
 }
 
 _DARK = {
@@ -60,6 +61,7 @@ _DARK = {
     "accent_pressed": "#1D4ED8",
     "accent_text": "#FFFFFF",
     "danger": "#F87171",
+    "success": "#6EE7A0",
 }
 
 SEMANTIC_PALETTES: Mapping[ResolvedTheme, Mapping[str, str]] = MappingProxyType(
@@ -110,6 +112,54 @@ def semantic_palette(
     style_hints: QStyleHints | None = None,
 ) -> Mapping[str, str]:
     return SEMANTIC_PALETTES[resolve_theme(theme, style_hints)]
+
+
+def semantic_qpalette(
+    theme: str,
+    style_hints: QStyleHints | None = None,
+) -> QPalette:
+    """Build a native Qt palette so standard controls/icons follow the theme."""
+    colors = semantic_palette(theme, style_hints)
+    palette = QPalette()
+    role_colors = {
+        QPalette.ColorRole.Window: colors["window"],
+        QPalette.ColorRole.WindowText: colors["text"],
+        QPalette.ColorRole.Base: colors["surface"],
+        QPalette.ColorRole.AlternateBase: colors["surface"],
+        QPalette.ColorRole.ToolTipBase: colors["surface"],
+        QPalette.ColorRole.ToolTipText: colors["text"],
+        QPalette.ColorRole.Text: colors["text"],
+        QPalette.ColorRole.Button: colors["surface"],
+        QPalette.ColorRole.ButtonText: colors["text"],
+        QPalette.ColorRole.BrightText: colors["accent_text"],
+        QPalette.ColorRole.Highlight: colors["accent"],
+        QPalette.ColorRole.HighlightedText: colors["accent_text"],
+        QPalette.ColorRole.Link: colors["accent"],
+        QPalette.ColorRole.PlaceholderText: colors["text_muted"],
+    }
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+        for role, color in role_colors.items():
+            palette.setColor(group, role, QColor(color))
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.PlaceholderText,
+    ):
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            role,
+            QColor(colors["text_disabled"]),
+        )
+    palette.setColor(
+        QPalette.ColorGroup.Disabled,
+        QPalette.ColorRole.Button,
+        QColor(colors["surface"]),
+    )
+    if hasattr(QPalette.ColorRole, "Accent"):
+        for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+            palette.setColor(group, QPalette.ColorRole.Accent, QColor(colors["accent"]))
+    return palette
 
 
 @lru_cache(maxsize=1)

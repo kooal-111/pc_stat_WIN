@@ -1,4 +1,4 @@
-# PC Stat 1.2.0 (Windows 11)
+# PC Stat 1.3.0 (Windows 11)
 
 Локальное приложение на Python: учёт **активного** времени за компьютером и по приложениям.
 
@@ -8,9 +8,13 @@
 
 Данные хранятся в SQLite: `%LOCALAPPDATA%\pc_stat_win\data.sqlite`. Активные интервалы буферизуются и сохраняются одним batch примерно раз в 30 секунд, при смене приложения, AFK, sleep и выходе, поэтому фоновая работа почти не создаёт дисковой нагрузки.
 
+## Конфиденциальность
+
+PC Stat работает локально и не использует сеть, телеметрию или облачную синхронизацию. База находится в `%LOCALAPPDATA%\pc_stat_win\data.sqlite`, а диагностические журналы — в `%LOCALAPPDATA%\pc_stat_win\logs\pc_stat.log`. Сохранение заголовков окон по умолчанию выключено и включается только пользователем в настройках; при отключении старые заголовки безопасно удаляются из основной базы и WAL. Срок хранения можно ограничить 30, 90, 180 или 365 днями, а кнопка «Удалить статистику» очищает историю без удаления настроек и правил. CSV создаётся только после явного нажатия пользователем кнопки экспорта и сохраняется в выбранный им файл. Подробности: [`PRIVACY.md`](PRIVACY.md).
+
 **Имена и иконки в таблице:** отображаемое имя берётся из ресурсов версии Windows (`FileDescription` / `ProductName` в exe); если их нет — из имени файла. Иконка — системная для этого exe (как в Проводнике), с кэшированием.
 
-**Иконка самого PC Stat:** окно, панель задач и трей используют общий значок из `pc_stat_win/assets/app.png` (генерируется при сборке; свой PNG — `app.png` или устаревшее имя `app_icon.png`). Для иконки файла `.exe` в Проводнике PyInstaller вшивает `app.ico` (создаётся при `build_windows.ps1`).
+**Иконка самого PC Stat:** окно, панель задач и трей используют отслеживаемый значок из `pc_stat_win/assets/app.png`. Для иконки файла `.exe` в Проводнике PyInstaller вшивает отслеживаемый `pc_stat_win/assets/app.ico`; сборка не изменяет эти исходные ресурсы.
 
 **Сводка и топ-5:** на вкладке «Статистика» — длительность периода, оценка времени работы ПК в периоде (по журналу загрузок), **доля активного времени от этой оценки**, полосы топ-5.
 
@@ -36,7 +40,7 @@
 
 ## Скачать готовое приложение (.exe)
 
-**Обычному пользователю** нужен portable **`PCStat.exe`** (один файл, без Python) из **[последнего GitHub Release](https://github.com/kooal-111/pc_stat_WIN/releases/latest)**. Там же публикуется `SHA256SUMS.txt` для проверки файла. Запуск — двойной щелчок по `PCStat.exe`. Краткая памятка также в [`download/README.txt`](download/README.txt).
+**Обычному пользователю** нужен portable **`PCStat.exe`** (один файл, без Python) из **[последнего GitHub Release](https://github.com/kooal-111/pc_stat_WIN/releases/latest)**. Там же публикуется `SHA256SUMS.txt` для проверки файла. CI-артефакт получает GitHub/Sigstore provenance attestation; происхождение скачанного EXE можно проверить командой `gh attestation verify PCStat.exe --repo kooal-111/pc_stat_WIN`. Запуск — двойной щелчок по `PCStat.exe`. Краткая памятка также в [`download/README.txt`](download/README.txt).
 
 Как взять папку с GitHub:
 
@@ -45,7 +49,8 @@
 
 **Всё остальное в репозитории** (`pc_stat_win/`, `scripts/`, `.spec` и т.д.) — **открытый исходный код** для разработчиков и сборки; для ежедневного использования приложения можно не разбираться.
 
-Публикация репозитория и анонимность коммитов: [docs/GITHUB.md](docs/GITHUB.md).
+Публикация репозитория и анонимность коммитов: [docs/GITHUB.md](docs/GITHUB.md). Политика
+ответственного сообщения об уязвимостях: [`SECURITY.md`](SECURITY.md).
 
 ## Локальная сборка установщика (альтернатива)
 
@@ -80,7 +85,7 @@ sqlite3 "$env:LOCALAPPDATA\pc_stat_win\data.sqlite" "SELECT key, value FROM meta
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt или python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements-lock.txt
 ```
 
 Если при импорте `win32` возникают ошибки, для установки через pip иногда нужно выполнить постустановку pywin32 (см. [pywin32 wiki](https://github.com/mhammond/pywin32/wiki)).
@@ -129,14 +134,21 @@ python -m pc_stat_win
 
 Единственный источник версии приложения — `APP_VERSION` в `pc_stat_win/version.py`. Во время Windows-сборки `scripts/generate_version_metadata.py` проверяет формат `MAJOR.MINOR.PATCH` и создаёт ресурс PyInstaller в `build/PCStat_version_info.txt`; этот сгенерированный файл не коммитится. `build_installer.ps1` передаёт ту же версию в Inno Setup.
 
-Portable release собирается и публикуется так:
+Portable release проверяется, собирается и публикуется одной командой из чистого Git checkout:
 
 ```powershell
-.\scripts\build_windows.ps1 -OneFile
 .\scripts\publish_release.ps1
 ```
 
-`publish_release.ps1` сам формирует тег `v<APP_VERSION>` и заголовок релиза, создаёт `dist\SHA256SUMS.txt` и прикладывает к GitHub Release ровно `dist\PCStat.exe` и checksum-файл. Для команды нужны установленный и авторизованный GitHub CLI (`gh`).
+Перед запуском установите Git и GitHub CLI, затем выполните `gh auth login -h github.com`. Сначала отправьте проверенный commit в `origin/main`. Скрипт требует чистое рабочее дерево, запускает unit-тесты и source UI smoke, ждёт успешный Windows CI для точного `HEAD`, скачивает собранный там onefile-артефакт и проверяет его GitHub/Sigstore attestation, checksum, packaged smoke на временной SQLite-базе (schema 7 и `PRAGMA quick_check`), а также `FileVersion` и `ProductVersion`. После этого он создаёт или проверяет аннотированный тег `v<APP_VERSION>` строго на текущем `HEAD`, отправляет и повторно проверяет тег и публикует только проверенные CI-файлы через `gh release create --verify-tag --target <HEAD> --repo <owner/name>`.
+
+Для ручной локальной onefile-сборки без публикации используйте:
+
+```powershell
+.\scripts\build_windows.ps1 -OneFile
+```
+
+Зависимости runtime и сборки закреплены точными версиями и SHA-256 в `requirements-lock.txt`; CI также запускает `pip-audit`. GitHub Actions привязаны к неизменяемым commit SHA, повторяют unit/UI smoke на Python 3.11 с масштабом Qt 100%, 150% и 200%, затем отдельно собирают, проверяют и аттестуют portable-артефакт.
 
 ## Настройки
 
@@ -144,6 +156,9 @@ Portable release собирается и публикуется так:
 - **Автозапуск с Windows** — запись в реестре (см. выше); для раздачи пользователям используйте установленный `PCStat.exe`.
 - **Порог AFK** — секунды без ввода, после которых вы считаетесь отошедшими от ПК (сбрасывается и активность ПК, и учёт приложения в фокусе).
 - **Исключения** — имена `exe` через запятую (например `someapp.exe`), такие процессы не попадут в статистику по приложениям, даже если в фокусе.
+- **Заголовки окон** — выключены по умолчанию; отключение физически очищает ранее сохранённые значения.
+- **Срок хранения** — без ограничения либо 30/90/180/365 дней; очистка выполняется локально.
+- **Удалить статистику** — безопасно очищает интервалы и журнал загрузок, сохраняя настройки и правила категорий.
 
 ## Ограничения
 

@@ -8,6 +8,18 @@ from pc_stat_win.exe_metadata import friendly_app_name
 from pc_stat_win.formatting import format_duration_ms
 
 
+_SPREADSHEET_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def spreadsheet_safe_text(value: object) -> str:
+    """Keep user-controlled CSV text from becoming a spreadsheet formula."""
+    text = str(value)
+    candidate = text.lstrip(" \ufeff")
+    if candidate.startswith(_SPREADSHEET_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
 def export_apps_csv(
     db: Database, q_from: float, q_to: float, file_path: str, stats: PeriodStats | None = None
 ) -> None:
@@ -25,9 +37,9 @@ def export_apps_csv(
             cat = a.category or db.resolve_category(a.exe_path)
             w.writerow(
                 [
-                    friendly_app_name(a.exe_path),
-                    a.exe_path,
-                    CATEGORY_LABELS_RU.get(cat, cat),
+                    spreadsheet_safe_text(friendly_app_name(a.exe_path)),
+                    spreadsheet_safe_text(a.exe_path),
+                    spreadsheet_safe_text(CATEGORY_LABELS_RU.get(cat, cat)),
                     int(round(a.active_ms)),
                     format_duration_ms(a.active_ms),
                 ]

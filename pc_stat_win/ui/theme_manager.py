@@ -11,6 +11,7 @@ from pc_stat_win.ui.styles import (
     normalize_theme,
     render_stylesheet,
     resolve_theme,
+    semantic_qpalette,
 )
 from pc_stat_win.ui.window_material import apply_window_material
 
@@ -61,6 +62,7 @@ class ThemeManager(QObject):
         resolved = resolve_theme(self._mode, self._style_hints)
         self._app.setProperty("themeMode", self._mode)
         self._app.setProperty("resolvedTheme", resolved)
+        self._app.setPalette(semantic_qpalette(resolved, self._style_hints))
         self._app.setStyleSheet(render_stylesheet(resolved))
 
         for window in tuple(self._windows):

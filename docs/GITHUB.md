@@ -60,9 +60,10 @@ git push origin main
 
 ## GitHub Releases
 
-Релиз содержит portable `PCStat.exe` и `SHA256SUMS.txt`.
+Релиз содержит portable `PCStat.exe` и `SHA256SUMS.txt`. EXE собирается в Windows CI и получает
+GitHub/Sigstore provenance attestation.
 
-1. Соберите `dist\PCStat.exe` командой `.\scripts\build_windows.ps1 -OneFile`.
+1. Отправьте проверенный commit в `origin/main` и дождитесь запуска Windows CI.
 2. Установите [GitHub CLI](https://cli.github.com/) и выполните `gh auth login`.
 3. Создайте релиз:
 
@@ -70,9 +71,11 @@ git push origin main
 .\scripts\publish_release.ps1
 ```
 
-Скрипт читает `APP_VERSION` из `pc_stat_win/version.py`, формирует тег `v<APP_VERSION>`, создаёт checksum и публикует оба portable-файла.
+Скрипт читает `APP_VERSION` из `pc_stat_win/version.py`, находит CI для точного `HEAD`, ждёт его
+завершения, скачивает артефакт, проверяет checksum и `gh attestation verify`, затем формирует тег
+`v<APP_VERSION>` и публикует оба проверенных portable-файла.
 
-**Вручную:** на сайте GitHub → репозиторий → **Releases** → **Draft a new release** → тег версии → прикрепите `PCStat.exe` и `SHA256SUMS.txt` → **Publish release**.
+Ручная загрузка локально собранного EXE не рекомендуется: она обходит provenance-проверку.
 
 Ссылка «последняя версия»:
 

@@ -1,22 +1,48 @@
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
+import getpass
+import hashlib
 from collections.abc import Callable
 
-from PySide6.QtCore import QCoreApplication
+import win32api
+import win32con
+import win32security
+from PySide6.QtCore import QCoreApplication, QLockFile
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
+from pc_stat_win.config import default_db_path
 
-ERROR_ALREADY_EXISTS = 183
-DEFAULT_MUTEX_NAME = r"Local\PCStatWin.SingleInstance"
-DEFAULT_SERVER_NAME = "PCStatWin.SingleInstance.IPC"
+
 SHOW_COMMAND = "show"
 MAX_COMMAND_BYTES = 1024
 
 
+def current_user_identity() -> str:
+    """Return a stable, kernel-object-safe identity for the current Windows user."""
+    try:
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(),
+            win32con.TOKEN_QUERY,
+        )
+        sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        return win32security.ConvertSidToStringSid(sid)
+    except (OSError, AttributeError, win32security.error):
+        fallback = getpass.getuser().encode("utf-8", errors="replace")
+        return hashlib.sha256(fallback).hexdigest()[:24]
+
+
+_USER_IDENTITY = current_user_identity()
+DEFAULT_MUTEX_NAME = f"PCStatWin.SingleInstance.{_USER_IDENTITY}"
+DEFAULT_SERVER_NAME = f"PCStatWin.SingleInstance.IPC.{_USER_IDENTITY}"
+
+
+def _lock_path(identifier: str) -> str:
+    digest = hashlib.sha256(identifier.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return str(default_db_path().parent / f"instance-{digest}.lock")
+
+
 class SingleInstance:
-    """Named Windows mutex guard with local IPC for the running instance."""
+    """Per-profile file lock with user-only local IPC for activation."""
 
     def __init__(
         self,
@@ -24,21 +50,20 @@ class SingleInstance:
         server_name: str = DEFAULT_SERVER_NAME,
         on_show: Callable[[], None] | None = None,
     ) -> None:
-        self._kernel32 = ctypes.windll.kernel32
-        self._kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
-        self._kernel32.CreateMutexW.restype = wintypes.HANDLE
-        self._kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        self._kernel32.CloseHandle.restype = wintypes.BOOL
         self._server_name = server_name
         self._on_show = on_show
         self._server: QLocalServer | None = None
         self._sockets: set[QLocalSocket] = set()
         self._buffers: dict[QLocalSocket, bytearray] = {}
-        self._handle = self._kernel32.CreateMutexW(None, False, name)
-        self.already_running = False
+        lock_path = _lock_path(name)
+        default_db_path().parent.mkdir(parents=True, exist_ok=True)
+        self._lock = QLockFile(lock_path)
+        self._lock.setStaleLockTime(0)
+        acquired = self._lock.tryLock(0)
+        if not acquired and self._lock.error() != QLockFile.LockError.LockFailedError:
+            raise OSError(f"Unable to acquire the PC Stat instance lock: {lock_path}")
+        self.already_running = not acquired
         self.activation_sent = False
-        if self._handle:
-            self.already_running = self._kernel32.GetLastError() == ERROR_ALREADY_EXISTS
         if self.already_running:
             self.activation_sent = self.send_command(SHOW_COMMAND)
         else:
@@ -51,6 +76,7 @@ class SingleInstance:
             return False
 
         server = QLocalServer()
+        server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         if not server.listen(self._server_name):
             QLocalServer.removeServer(self._server_name)
             if not server.listen(self._server_name):
@@ -157,9 +183,10 @@ class SingleInstance:
             self._server.deleteLater()
             self._server = None
             QLocalServer.removeServer(self._server_name)
-        if self._handle:
-            self._kernel32.CloseHandle(wintypes.HANDLE(self._handle))
-            self._handle = None
+        if self._lock is not None:
+            if not self.already_running:
+                self._lock.unlock()
+            self._lock = None
 
     def __enter__(self) -> "SingleInstance":
         return self

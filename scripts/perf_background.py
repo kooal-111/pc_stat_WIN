@@ -19,7 +19,6 @@ from PySide6.QtWidgets import QApplication
 
 from pc_stat_win.collector import UsageCollector
 from pc_stat_win.db import Database
-from pc_stat_win.ui.theme_manager import ThemeManager
 
 
 def main() -> int:
@@ -29,7 +28,6 @@ def main() -> int:
     seconds = max(2.0, args.seconds)
 
     app = QApplication([])
-    ThemeManager(app, "system", app)
     process = psutil.Process()
     with tempfile.TemporaryDirectory(prefix="pc_stat_background_") as tmp:
         db = Database(Path(tmp) / "data.sqlite")

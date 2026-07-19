@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta
@@ -16,8 +16,12 @@ from pc_stat_win.categories import (
     resolve_default_category,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _CATEGORY_CHECK_SQL = ",".join(f"'{k}'" for k in ALL_CATEGORY_KEYS)
+_BUSY_TIMEOUT_MS = 500
+_WAL_AUTOCHECKPOINT_PAGES = 256
+_JOURNAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024
+RETENTION_DAY_OPTIONS = (0, 30, 90, 180, 365)
 
 
 def _overlap_ms(start_ts: float, end_ts: float, duration_ms: int, q_from: float, q_to: float) -> float:
@@ -102,7 +106,12 @@ class Database:
             raise
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.Error:
+            pass
+        finally:
+            self._conn.close()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -116,53 +125,133 @@ class Database:
             raise
 
     def _init_schema(self) -> None:
-        self._conn.executescript(
-            f"""
-            PRAGMA busy_timeout = 5000;
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA foreign_keys = ON;
+        conn = self._conn
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA secure_delete = ON")
+        conn.execute(f"PRAGMA wal_autocheckpoint = {_WAL_AUTOCHECKPOINT_PAGES}")
+        conn.execute(f"PRAGMA journal_size_limit = {_JOURNAL_SIZE_LIMIT_BYTES}")
 
-            CREATE TABLE IF NOT EXISTS meta (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL
-            );
+        user_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if not user_tables:
+            self._create_schema_v7()
+        else:
+            if "meta" not in user_tables:
+                with self.transaction() as tx:
+                    tx.execute(
+                        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                    )
+                    self._set_schema_version(tx, 1)
+            elif self._schema_version() is None:
+                with self.transaction() as tx:
+                    self._set_schema_version(tx, 1)
+            self._apply_migrations()
+        self.apply_retention_policy()
 
-            CREATE TABLE IF NOT EXISTS intervals (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              kind TEXT NOT NULL CHECK (kind IN ('pc_active', 'app')),
-              exe_path TEXT,
-              exe_name TEXT,
-              window_title TEXT,
-              start_ts REAL NOT NULL,
-              end_ts REAL NOT NULL,
-              duration_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS boot_log (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              boot_ts REAL NOT NULL,
-              logged_at REAL NOT NULL
-            );
+    def _create_schema_v7(self) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE intervals (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  kind TEXT NOT NULL CHECK (kind IN ('pc_active', 'app')),
+                  exe_path TEXT,
+                  exe_name TEXT,
+                  window_title TEXT,
+                  start_ts REAL NOT NULL,
+                  end_ts REAL NOT NULL,
+                  duration_ms INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE boot_log (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  boot_ts REAL NOT NULL,
+                  logged_at REAL NOT NULL,
+                  last_seen_ts REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE app_category_rules (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  match_text TEXT NOT NULL,
+                  match_kind TEXT NOT NULL CHECK (
+                    match_kind IN ('exact_basename', 'path_contains')
+                  ),
+                  category TEXT NOT NULL CHECK (category IN ({_CATEGORY_CHECK_SQL})),
+                  priority INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self._create_final_indexes(conn)
+            conn.execute(
+                """
+                INSERT INTO meta (key, value)
+                VALUES ('collect_window_titles', '0')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO meta (key, value)
+                VALUES ('retention_days', '0')
+                """
+            )
+            self._set_schema_version(conn, SCHEMA_VERSION)
 
-            CREATE TABLE IF NOT EXISTS app_category_rules (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              match_text TEXT NOT NULL,
-              match_kind TEXT NOT NULL CHECK (match_kind IN ('exact_basename', 'path_contains')),
-              category TEXT NOT NULL CHECK (category IN ({_CATEGORY_CHECK_SQL})),
-              priority INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_app_cat_rules_prio
-              ON app_category_rules (priority DESC, id DESC);
+    def _create_final_indexes(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_intervals_kind_start "
+            "ON intervals (kind, start_ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_app_cat_rules_prio "
+            "ON app_category_rules (priority DESC, id DESC)"
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_app_cat_rules_normalized_unique
+            ON app_category_rules (
+              match_kind,
+              lower(trim(replace(match_text, char(92), '/')))
+            )
             """
         )
-        row = self._conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+
+    def _schema_version(self) -> int | None:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
         if row is None:
-            self._conn.execute(
-                "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-                ("1",),
-            )
-        self._conn.commit()
-        self._apply_migrations()
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
+        conn.execute(
+            """
+            INSERT INTO meta (key, value) VALUES ('schema_version', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(version),),
+        )
 
     # --- settings ---
     def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -216,6 +305,75 @@ class Database:
     def set_show_main_window_on_launch(self, show: bool) -> None:
         self.set_setting("show_main_window_on_launch", "1" if show else "0")
 
+    def get_collect_window_titles(self) -> bool:
+        return (self.get_setting("collect_window_titles", "0") or "0") == "1"
+
+    def set_collect_window_titles(self, enabled: bool) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO meta (key, value) VALUES ('collect_window_titles', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("1" if enabled else "0",),
+            )
+            if not enabled:
+                conn.execute(
+                    "UPDATE intervals SET window_title = NULL "
+                    "WHERE window_title IS NOT NULL"
+                )
+        if not enabled:
+            self._compact_private_data()
+
+    def get_retention_days(self) -> int:
+        raw = self.get_setting("retention_days", "0") or "0"
+        try:
+            days = int(raw)
+        except ValueError:
+            return 0
+        return days if days in RETENTION_DAY_OPTIONS else 0
+
+    def set_retention_days(self, days: int) -> None:
+        normalized = int(days)
+        if normalized not in RETENTION_DAY_OPTIONS:
+            raise ValueError(f"unsupported retention period: {days}")
+        self.set_setting("retention_days", str(normalized))
+
+    def apply_retention_policy(self, *, now: float | None = None) -> int:
+        days = self.get_retention_days()
+        if days <= 0:
+            return 0
+        cutoff = (time.time() if now is None else float(now)) - days * 86400.0
+        with self.transaction() as conn:
+            interval_count = conn.execute(
+                "DELETE FROM intervals WHERE end_ts < ?", (cutoff,)
+            ).rowcount
+            boot_count = conn.execute(
+                "DELETE FROM boot_log WHERE last_seen_ts < ?", (cutoff,)
+            ).rowcount
+        deleted = max(0, int(interval_count)) + max(0, int(boot_count))
+        if deleted:
+            self._compact_private_data()
+        return deleted
+
+    def delete_all_history(self) -> int:
+        """Delete collected usage while preserving settings and category rules."""
+        with self.transaction() as conn:
+            interval_count = conn.execute("DELETE FROM intervals").rowcount
+            boot_count = conn.execute("DELETE FROM boot_log").rowcount
+            conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('intervals', 'boot_log')"
+            )
+        self._compact_private_data()
+        return max(0, int(interval_count)) + max(0, int(boot_count))
+
+    def _compact_private_data(self) -> None:
+        """Remove deleted payloads from the main DB and the WAL."""
+        self._conn.execute("PRAGMA secure_delete = ON")
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._conn.execute("VACUUM")
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     # --- intervals ---
     def insert_interval(
         self,
@@ -262,72 +420,138 @@ class Database:
 
     def persist_usage(
         self,
-        pc: BufferedInterval | None = None,
-        app: BufferedInterval | None = None,
-    ) -> Persisted:
-        """Insert or update buffered PC/app intervals in one transaction."""
-        persisted: dict[str, int | None] = {"pc_active": None, "app": None}
-        with self.transaction() as conn:
-            for expected_kind, interval in (("pc_active", pc), ("app", app)):
-                if interval is None:
-                    continue
-                if interval.kind != expected_kind:
-                    raise ValueError(
-                        f"expected {expected_kind!r} interval, got {interval.kind!r}"
-                    )
-                if interval.duration_ms <= 0 or interval.end_ts <= interval.start_ts:
-                    raise ValueError("interval must have positive duration and wall-clock span")
-                if interval.row_id is None:
-                    cur = conn.execute(
-                        """
-                        INSERT INTO intervals (
-                          kind, exe_path, exe_name, window_title,
-                          start_ts, end_ts, duration_ms
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            interval.kind,
-                            interval.exe_path,
-                            interval.exe_name,
-                            interval.window_title,
-                            interval.start_ts,
-                            interval.end_ts,
-                            interval.duration_ms,
-                        ),
-                    )
-                    persisted[expected_kind] = int(cur.lastrowid)
-                else:
+        intervals: Sequence[BufferedInterval] | BufferedInterval | None = (),
+        legacy_app: BufferedInterval | None = None,
+    ) -> list[int] | Persisted:
+        """Persist intervals atomically and return row IDs in input order.
+
+        The two-interval form is retained for compatibility with 1.2 callers. New
+        code must pass one sequence and receives ``list[int]``.
+        """
+        legacy_call = isinstance(intervals, BufferedInterval) or legacy_app is not None
+        if legacy_call:
+            pc = intervals if isinstance(intervals, BufferedInterval) else None
+            if pc is not None and pc.kind != "pc_active":
+                raise ValueError(f"expected 'pc_active' interval, got {pc.kind!r}")
+            if legacy_app is not None and legacy_app.kind != "app":
+                raise ValueError(f"expected 'app' interval, got {legacy_app.kind!r}")
+            batch = [item for item in (pc, legacy_app) if item is not None]
+        else:
+            batch = list(intervals or ())
+
+        for interval in batch:
+            if not isinstance(interval, BufferedInterval):
+                raise TypeError("persist_usage accepts BufferedInterval values")
+            if interval.kind not in ("pc_active", "app"):
+                raise ValueError(f"unsupported interval kind: {interval.kind!r}")
+            if interval.duration_ms <= 0 or interval.end_ts <= interval.start_ts:
+                raise ValueError("interval must have positive duration and wall-clock span")
+
+        row_ids: list[int] = []
+        if batch:
+            with self.transaction() as conn:
+                for interval in batch:
+                    if interval.row_id is None:
+                        cur = conn.execute(
+                            """
+                            INSERT INTO intervals (
+                              kind, exe_path, exe_name, window_title,
+                              start_ts, end_ts, duration_ms
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                interval.kind,
+                                interval.exe_path,
+                                interval.exe_name,
+                                interval.window_title,
+                                interval.start_ts,
+                                interval.end_ts,
+                                interval.duration_ms,
+                            ),
+                        )
+                        row_ids.append(int(cur.lastrowid))
+                        continue
+
                     cur = conn.execute(
                         """
                         UPDATE intervals
-                        SET end_ts = ?, duration_ms = ?
+                        SET end_ts = ?, duration_ms = ?, window_title = ?
                         WHERE id = ? AND kind = ?
                         """,
                         (
                             interval.end_ts,
                             interval.duration_ms,
+                            interval.window_title,
                             interval.row_id,
                             interval.kind,
                         ),
                     )
                     if cur.rowcount != 1:
-                        raise LookupError(f"interval row {interval.row_id} no longer exists")
-                    persisted[expected_kind] = interval.row_id
-        return Persisted(
-            pc_row_id=persisted["pc_active"],
-            app_row_id=persisted["app"],
-        )
+                        raise LookupError(
+                            f"interval row {interval.row_id} no longer exists"
+                        )
+                    row_ids.append(interval.row_id)
 
-    def log_boot_if_new(self, boot_ts: float) -> None:
-        last = self._conn.execute(
-            "SELECT boot_ts FROM boot_log ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if last is None or abs(float(last[0]) - boot_ts) > 60:
-            self._conn.execute(
-                "INSERT INTO boot_log (boot_ts, logged_at) VALUES (?, ?)",
-                (boot_ts, time.time()),
+        if legacy_call:
+            id_iter = iter(row_ids)
+            return Persisted(
+                pc_row_id=next(id_iter) if isinstance(intervals, BufferedInterval) else None,
+                app_row_id=next(id_iter) if legacy_app is not None else None,
             )
-            self._conn.commit()
+        return row_ids
+
+    def log_boot_if_new(self, boot_ts: float, seen_ts: float | None = None) -> int:
+        seen = time.time() if seen_ts is None else float(seen_ts)
+        with self.transaction() as conn:
+            last = conn.execute(
+                "SELECT id, boot_ts FROM boot_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if last is not None and abs(float(last["boot_ts"]) - boot_ts) <= 60:
+                row_id = int(last["id"])
+                conn.execute(
+                    """
+                    UPDATE boot_log
+                    SET last_seen_ts = max(
+                      coalesce(last_seen_ts, logged_at, boot_ts), ?
+                    )
+                    WHERE id = ?
+                    """,
+                    (seen, row_id),
+                )
+                return row_id
+            cur = conn.execute(
+                """
+                INSERT INTO boot_log (boot_ts, logged_at, last_seen_ts)
+                VALUES (?, ?, ?)
+                """,
+                (boot_ts, seen, seen),
+            )
+            return int(cur.lastrowid)
+
+    def touch_boot(self, boot_ts: float, seen_ts: float | None = None) -> bool:
+        seen = time.time() if seen_ts is None else float(seen_ts)
+        with self.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM boot_log
+                WHERE abs(boot_ts - ?) <= 60
+                ORDER BY id DESC LIMIT 1
+                """,
+                (boot_ts,),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                """
+                UPDATE boot_log
+                SET last_seen_ts = max(
+                  coalesce(last_seen_ts, logged_at, boot_ts), ?
+                )
+                WHERE id = ?
+                """,
+                (seen, int(row["id"])),
+            )
+            return True
 
     def total_pc_ms(self, q_from: float, q_to: float) -> float:
         total = 0.0
@@ -353,15 +577,27 @@ class Database:
         return total
 
     def estimated_pc_uptime_seconds(self, q_from: float, q_to: float) -> float:
-        """Сумма длин пересечений сессий [boot_i, boot_{i+1}) с [q_from, q_to]; последняя сессия до now."""
-        rows = self._conn.execute("SELECT boot_ts FROM boot_log ORDER BY boot_ts ASC").fetchall()
+        """Estimate uptime without counting offline gaps between recorded boots."""
+        rows = self._conn.execute(
+            """
+            SELECT boot_ts, logged_at, last_seen_ts
+            FROM boot_log ORDER BY boot_ts ASC, id ASC
+            """
+        ).fetchall()
         if not rows:
-            return max(0.0, q_to - q_from)
-        boots = [float(r[0]) for r in rows]
+            return 0.0
         now = time.time()
         total = 0.0
-        for i, start in enumerate(boots):
-            end = boots[i + 1] if i + 1 < len(boots) else now
+        for index, row in enumerate(rows):
+            start = float(row["boot_ts"])
+            recorded_end = max(
+                start,
+                float(row["last_seen_ts"] or row["logged_at"] or start),
+            )
+            if index == len(rows) - 1:
+                end = max(recorded_end, now)
+            else:
+                end = min(recorded_end, float(rows[index + 1]["boot_ts"]))
             total += max(0.0, min(end, q_to) - max(start, q_from))
         return total
 
@@ -413,100 +649,157 @@ class Database:
         return float(row[0])
 
     def boot_time_sum_logged(self) -> float | None:
-        """Sum of (logged_at - boot_ts) per boot session row — rough 'time machine was on while tracker ran'."""
-        rows = self._conn.execute("SELECT boot_ts, logged_at FROM boot_log").fetchall()
+        """Sum the recorded extent of each boot session."""
+        rows = self._conn.execute(
+            "SELECT boot_ts, logged_at, last_seen_ts FROM boot_log"
+        ).fetchall()
         if not rows:
             return None
-        return sum(max(0.0, float(r["logged_at"]) - float(r["boot_ts"])) for r in rows)
+        return sum(
+            max(
+                0.0,
+                float(r["last_seen_ts"] or r["logged_at"]) - float(r["boot_ts"]),
+            )
+            for r in rows
+        )
 
     def _apply_migrations(self) -> None:
-        raw = self.get_setting("schema_version", "1")
-        try:
-            ver = int(raw or "1")
-        except ValueError:
-            ver = 1
+        ver = self._schema_version() or 1
         if ver < 2:
-            self._conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS app_category_rules (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  match_text TEXT NOT NULL,
-                  match_kind TEXT NOT NULL CHECK (match_kind IN ('exact_basename', 'path_contains')),
-                  category TEXT NOT NULL CHECK (category IN ('productive', 'unproductive', 'neutral')),
-                  priority INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE INDEX IF NOT EXISTS idx_app_cat_rules_prio ON app_category_rules (priority DESC, id DESC);
-                """
-            )
-            self.set_setting("schema_version", "2")
+            with self.transaction() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS app_category_rules (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      match_text TEXT NOT NULL,
+                      match_kind TEXT NOT NULL CHECK (
+                        match_kind IN ('exact_basename', 'path_contains')
+                      ),
+                      category TEXT NOT NULL CHECK (
+                        category IN ('productive', 'unproductive', 'neutral')
+                      ),
+                      priority INTEGER NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_app_cat_rules_prio "
+                    "ON app_category_rules (priority DESC, id DESC)"
+                )
+                self._set_schema_version(conn, 2)
             ver = 2
         if ver < 3:
-            self._conn.executescript(
-                """
-                CREATE TABLE app_category_rules_new (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  match_text TEXT NOT NULL,
-                  match_kind TEXT NOT NULL CHECK (match_kind IN ('exact_basename', 'path_contains')),
-                  category TEXT NOT NULL CHECK (category IN (
-                    'work','distraction','communication','games','media','devtools','system','other'
-                  )),
-                  priority INTEGER NOT NULL DEFAULT 0
-                );
-                INSERT INTO app_category_rules_new (id, match_text, match_kind, category, priority)
-                SELECT id, match_text, match_kind,
-                  CASE category
-                    WHEN 'productive' THEN 'work'
-                    WHEN 'unproductive' THEN 'distraction'
-                    WHEN 'neutral' THEN 'other'
-                    ELSE category
-                  END,
-                  priority
-                FROM app_category_rules;
-                DROP TABLE app_category_rules;
-                ALTER TABLE app_category_rules_new RENAME TO app_category_rules;
-                CREATE INDEX IF NOT EXISTS idx_app_cat_rules_prio ON app_category_rules (priority DESC, id DESC);
-                """
-            )
-            self.set_setting("schema_version", "3")
+            with self.transaction() as conn:
+                conn.execute("DROP TABLE IF EXISTS app_category_rules_new")
+                conn.execute(
+                    """
+                    CREATE TABLE app_category_rules_new (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      match_text TEXT NOT NULL,
+                      match_kind TEXT NOT NULL CHECK (
+                        match_kind IN ('exact_basename', 'path_contains')
+                      ),
+                      category TEXT NOT NULL CHECK (category IN (
+                        'work','distraction','communication','games',
+                        'media','devtools','system','other'
+                      )),
+                      priority INTEGER NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO app_category_rules_new (
+                      id, match_text, match_kind, category, priority
+                    )
+                    SELECT id, match_text, match_kind,
+                      CASE category
+                        WHEN 'productive' THEN 'work'
+                        WHEN 'unproductive' THEN 'distraction'
+                        WHEN 'neutral' THEN 'other'
+                        ELSE category
+                      END,
+                      priority
+                    FROM app_category_rules
+                    """
+                )
+                conn.execute("DROP TABLE app_category_rules")
+                conn.execute(
+                    "ALTER TABLE app_category_rules_new "
+                    "RENAME TO app_category_rules"
+                )
+                conn.execute(
+                    "CREATE INDEX idx_app_cat_rules_prio "
+                    "ON app_category_rules (priority DESC, id DESC)"
+                )
+                self._set_schema_version(conn, 3)
             ver = 3
         if ver < 4:
-            if self.get_setting("show_main_window_on_launch") is None:
-                self.set_setting("show_main_window_on_launch", "1")
-            self.set_setting("schema_version", "4")
+            with self.transaction() as conn:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO meta (key, value)
+                    VALUES ('show_main_window_on_launch', '1')
+                    """
+                )
+                self._set_schema_version(conn, 4)
             ver = 4
         if ver < 5:
-            self._conn.executescript(
-                f"""
-                CREATE TABLE app_category_rules_new (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  match_text TEXT NOT NULL,
-                  match_kind TEXT NOT NULL CHECK (match_kind IN ('exact_basename', 'path_contains')),
-                  category TEXT NOT NULL CHECK (category IN ({_CATEGORY_CHECK_SQL})),
-                  priority INTEGER NOT NULL DEFAULT 0
-                );
-                INSERT INTO app_category_rules_new (id, match_text, match_kind, category, priority)
-                SELECT id, match_text, match_kind,
-                  CASE category
-                    WHEN 'productive' THEN 'work'
-                    WHEN 'unproductive' THEN 'distraction'
-                    WHEN 'neutral' THEN 'other'
-                    ELSE category
-                  END,
-                  priority
-                FROM app_category_rules;
-                DROP TABLE app_category_rules;
-                ALTER TABLE app_category_rules_new RENAME TO app_category_rules;
-                CREATE INDEX IF NOT EXISTS idx_app_cat_rules_prio
-                  ON app_category_rules (priority DESC, id DESC);
-                """
-            )
-            if self.get_setting("autostart_enabled") is None:
-                self.set_setting("autostart_enabled", "0")
-            self.set_setting("schema_version", "5")
+            with self.transaction() as conn:
+                conn.execute("DROP TABLE IF EXISTS app_category_rules_new")
+                conn.execute(
+                    f"""
+                    CREATE TABLE app_category_rules_new (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      match_text TEXT NOT NULL,
+                      match_kind TEXT NOT NULL CHECK (
+                        match_kind IN ('exact_basename', 'path_contains')
+                      ),
+                      category TEXT NOT NULL CHECK (
+                        category IN ({_CATEGORY_CHECK_SQL})
+                      ),
+                      priority INTEGER NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO app_category_rules_new (
+                      id, match_text, match_kind, category, priority
+                    )
+                    SELECT id, match_text, match_kind,
+                      CASE category
+                        WHEN 'productive' THEN 'work'
+                        WHEN 'unproductive' THEN 'distraction'
+                        WHEN 'neutral' THEN 'other'
+                        ELSE category
+                      END,
+                      priority
+                    FROM app_category_rules
+                    """
+                )
+                conn.execute("DROP TABLE app_category_rules")
+                conn.execute(
+                    "ALTER TABLE app_category_rules_new "
+                    "RENAME TO app_category_rules"
+                )
+                conn.execute(
+                    "CREATE INDEX idx_app_cat_rules_prio "
+                    "ON app_category_rules (priority DESC, id DESC)"
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO meta (key, value)
+                    VALUES ('autostart_enabled', '0')
+                    """
+                )
+                self._set_schema_version(conn, 5)
             ver = 5
         if ver < 6:
             self._migrate_v5_to_v6()
             ver = 6
+        if ver < 7:
+            self._migrate_v6_to_v7()
 
     def _migrate_v5_to_v6(self) -> None:
         with self.transaction() as conn:
@@ -517,12 +810,80 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_intervals_kind_start "
                 "ON intervals (kind, start_ts)"
             )
+            self._set_schema_version(conn, 6)
+
+    def _migrate_v6_to_v7(self) -> None:
+        with self.transaction() as conn:
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(boot_log)")
+            }
+            if "last_seen_ts" not in columns:
+                conn.execute("ALTER TABLE boot_log ADD COLUMN last_seen_ts REAL")
             conn.execute(
                 """
-                INSERT INTO meta (key, value) VALUES ('schema_version', '6')
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                UPDATE boot_log
+                SET last_seen_ts = max(
+                  boot_ts,
+                  coalesce(last_seen_ts, logged_at, boot_ts)
+                )
                 """
             )
+            conn.execute(
+                "UPDATE intervals SET window_title = NULL "
+                "WHERE window_title IS NOT NULL"
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO meta (key, value)
+                VALUES ('collect_window_titles', '0')
+                """
+            )
+
+            rows = conn.execute(
+                """
+                SELECT id, match_text, match_kind, category, priority
+                FROM app_category_rules
+                ORDER BY priority DESC, id DESC
+                """
+            ).fetchall()
+            seen: set[tuple[str, str]] = set()
+            for row in rows:
+                rule_id = int(row["id"])
+                match_kind = str(row["match_kind"] or "").strip().lower()
+                match_text = self._normalize_match_text(
+                    str(row["match_text"] or ""), match_kind
+                )
+                key = (match_kind, match_text.replace("\\", "/").strip().lower())
+                if key in seen:
+                    conn.execute(
+                        "DELETE FROM app_category_rules WHERE id = ?", (rule_id,)
+                    )
+                    continue
+                seen.add(key)
+                conn.execute(
+                    """
+                    UPDATE app_category_rules
+                    SET match_text = ?, match_kind = ?, category = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        match_text,
+                        match_kind,
+                        normalize_legacy_category(str(row["category"])),
+                        rule_id,
+                    ),
+                )
+            conn.execute("DROP INDEX IF EXISTS idx_app_cat_rules_normalized_unique")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX idx_app_cat_rules_normalized_unique
+                ON app_category_rules (
+                  match_kind,
+                  lower(trim(replace(match_text, char(92), '/')))
+                )
+                """
+            )
+            self._set_schema_version(conn, 7)
 
     # --- app categories ---
     def _invalidate_category_rules(self) -> None:
@@ -563,34 +924,40 @@ class Database:
                 "SELECT COALESCE(MAX(priority), 0) + 10 FROM app_category_rules"
             ).fetchone()
             priority = int(row[0]) if row else 10
-        cur = self._conn.execute(
-            """
-            INSERT INTO app_category_rules (match_text, match_kind, category, priority)
-            VALUES (?, ?, ?, ?)
-            """,
-            (norm_match, match_kind, normalize_legacy_category(category), priority),
-        )
-        self._conn.commit()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO app_category_rules (
+                  match_text, match_kind, category, priority
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    norm_match,
+                    match_kind,
+                    normalize_legacy_category(category),
+                    priority,
+                ),
+            )
         self._invalidate_category_rules()
         return int(cur.lastrowid)
 
     def update_category_rule(
         self, rule_id: int, match_text: str, match_kind: str, category: str
     ) -> None:
-        self._conn.execute(
-            """
-            UPDATE app_category_rules
-            SET match_text = ?, match_kind = ?, category = ?
-            WHERE id = ?
-            """,
-            (
-                self._normalize_match_text(match_text, match_kind),
-                match_kind,
-                normalize_legacy_category(category),
-                rule_id,
-            ),
-        )
-        self._conn.commit()
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE app_category_rules
+                SET match_text = ?, match_kind = ?, category = ?
+                WHERE id = ?
+                """,
+                (
+                    self._normalize_match_text(match_text, match_kind),
+                    match_kind,
+                    normalize_legacy_category(category),
+                    rule_id,
+                ),
+            )
         self._invalidate_category_rules()
 
     def delete_category_rule(self, rule_id: int) -> None:
