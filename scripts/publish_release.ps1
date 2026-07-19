@@ -100,7 +100,12 @@ if ($workflowRun.status -ne "completed") {
     throw "Windows CI run $($workflowRun.databaseId) concluded with '$($workflowRun.conclusion)'."
 }
 
-$releaseRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("pcstat_verified_release_" + [guid]::NewGuid().ToString("N"))
+$stagingBase = [System.IO.Path]::GetFullPath((Join-Path $root "output\release-staging"))
+$expectedStagingPrefix = [System.IO.Path]::GetFullPath((Join-Path $root "output")) + [System.IO.Path]::DirectorySeparatorChar
+if (-not $stagingBase.StartsWith($expectedStagingPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Release staging directory escaped the repository output directory."
+}
+$releaseRoot = Join-Path $stagingBase ([guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $releaseRoot | Out-Null
 try {
     $artifactName = "PCStat-$version-windows-x64"
@@ -133,7 +138,7 @@ try {
     }
 
     $expectedSchemaVersion = "7"
-    $smokeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pcstat_release_" + [guid]::NewGuid().ToString("N"))
+    $smokeDir = Join-Path $releaseRoot "smoke"
     $smokeDb = Join-Path $smokeDir "data.sqlite"
     New-Item -ItemType Directory -Path $smokeDir | Out-Null
     $oldDbPath = $env:PCSTAT_DB_PATH

@@ -107,10 +107,14 @@ class ReleaseV130Tests(unittest.TestCase):
             '"--repo", $Repo',
             'Join-Path $releaseRoot "PCStat.exe"',
             'Join-Path $releaseRoot "SHA256SUMS.txt"',
+            r'Join-Path $root "output\release-staging"',
+            'Join-Path $releaseRoot "smoke"',
+            "Release staging directory escaped the repository output directory.",
         )
         for fragment in required_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, script)
+        self.assertNotIn("[System.IO.Path]::GetTempPath()", script)
 
     def test_ci_covers_scales_tests_build_and_packaged_database(self) -> None:
         workflow = read(".github/workflows/ci.yml")
