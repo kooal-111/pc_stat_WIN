@@ -51,8 +51,8 @@ if ($Repo -notmatch "^[^/]+/[^/]+$") {
 }
 
 $version = Get-CheckedOutput "python" @((Join-Path $PSScriptRoot "generate_version_metadata.py"), "--print-version")
-if ($version -ne "1.3.0") {
-    throw "This release script expects APP_VERSION 1.3.0, got $version."
+if ($version -notmatch "^\d+\.\d+\.\d+$") {
+    throw "APP_VERSION must be a semantic numeric version, got '$version'."
 }
 $tag = "v$version"
 $headSha = Get-CheckedOutput "git" @("rev-parse", "HEAD")
@@ -146,7 +146,11 @@ try {
     try {
         $env:PCSTAT_DB_PATH = $smokeDb
         $env:QT_QPA_PLATFORM = "offscreen"
-        $process = Start-Process -FilePath $assetPath -ArgumentList "--smoke-test" -WindowStyle Hidden -Wait -PassThru
+        $process = Start-Process -FilePath $assetPath -ArgumentList "--smoke-test" -WindowStyle Hidden -PassThru
+        if (-not $process.WaitForExit(120000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw "Packaged smoke timed out after 120 seconds."
+        }
         if ($process.ExitCode -ne 0) {
             throw "Packaged smoke failed with exit code $($process.ExitCode)."
         }

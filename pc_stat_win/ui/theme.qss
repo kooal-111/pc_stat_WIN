@@ -15,7 +15,7 @@ QDialog {
 }
 
 QMainWindow[windowMaterial="mica"] {
-    background-color: transparent;
+    background-color: ${window_tint};
 }
 
 QMainWindow[windowMaterial="solid"],
@@ -26,6 +26,8 @@ QDialog[windowMaterial="solid"] {
 QFrame#card,
 QFrame#kpiCard,
 QFrame#glassSurface,
+QFrame#reportNavigator,
+QFrame#screenTimeCard,
 QWidget#glassSurface,
 QFrame[glass="true"],
 QWidget[glass="true"],
@@ -44,12 +46,22 @@ QFrame#navigationSurface {
     border-radius: 8px;
 }
 
-QWidget#windowSurface,
 QWidget#pageContent,
 QScrollArea#pageScroll,
 QScrollArea#pageScroll > QWidget > QWidget {
     background-color: transparent;
     border: none;
+}
+
+QWidget#windowSurface {
+    background-color: ${window};
+    border: none;
+}
+
+QWidget#periodSegmentHost {
+    background-color: ${surface_pressed};
+    border: 1px solid ${border};
+    border-radius: 8px;
 }
 
 QFrame#card {
@@ -59,6 +71,11 @@ QFrame#card {
 QFrame#kpiCard {
     background-color: ${surface_glass_strong};
     padding: 8px;
+}
+
+QFrame#screenTimeCard,
+QFrame#reportNavigator {
+    background-color: ${surface_glass_strong};
 }
 
 QLabel {
@@ -113,6 +130,41 @@ QLabel#metricValue {
     color: ${text};
     font-size: 18px;
     font-weight: 700;
+}
+
+QLabel#periodRangeTitle {
+    color: ${text};
+    font-size: 15px;
+    font-weight: 600;
+}
+
+QLabel#reportHeroValue {
+    color: ${text};
+    font-size: 32px;
+    font-weight: 700;
+}
+
+QLabel#comparisonText {
+    color: ${text_muted};
+    font-size: 13px;
+}
+
+QLabel#reportCategoryName {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QLabel#reportCategoryValue,
+QLabel#reportTotalValue,
+QLabel#usageDuration,
+QLabel#usageName {
+    color: ${text};
+    font-weight: 600;
+}
+
+QFrame#reportDivider {
+    background-color: ${border};
+    border: none;
 }
 
 QLabel#statusOk {
@@ -174,7 +226,7 @@ QSpinBox,
 QComboBox {
     background-color: ${surface_glass_strong};
     color: ${text};
-    border: 2px solid ${border};
+    border: 2px solid ${control_border};
     border-radius: 8px;
     min-height: 36px;
     max-height: 36px;
@@ -188,7 +240,7 @@ QPushButton {
 QToolButton {
     background-color: ${surface_glass_strong};
     color: ${text};
-    border: 2px solid ${border};
+    border: 2px solid ${control_border};
     border-radius: 8px;
     min-width: 36px;
     max-width: 36px;
@@ -203,7 +255,7 @@ QDoubleSpinBox:hover,
 QSpinBox:hover,
 QComboBox:hover {
     background-color: ${surface_hover};
-    border-color: ${border_strong};
+    border-color: ${control_border_strong};
 }
 
 QPushButton:pressed {
@@ -268,6 +320,18 @@ QToolButton[danger="true"] {
     color: ${danger};
 }
 
+QPushButton[flatAction="true"] {
+    background-color: transparent;
+    color: ${accent};
+    border-color: transparent;
+    padding: 0 8px;
+}
+
+QPushButton[flatAction="true"]:hover {
+    background-color: ${selection};
+    border-color: transparent;
+}
+
 QPushButton#btnExport,
 QPushButton[primary="true"],
 QPushButton[segment="true"][selected="true"],
@@ -306,6 +370,25 @@ QPushButton#periodYear,
 QPushButton#periodAll {
     background-color: ${surface_glass_strong};
     color: ${text};
+}
+
+QWidget#periodSegmentHost QPushButton[segment="true"] {
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    min-height: 32px;
+    max-height: 32px;
+    padding: 0 12px;
+}
+
+QWidget#periodSegmentHost QPushButton[segment="true"]:hover:!checked {
+    background-color: ${surface_hover};
+}
+
+QWidget#periodSegmentHost QPushButton[segment="true"]:checked {
+    background-color: ${accent};
+    color: ${accent_text};
+    border-color: ${accent};
 }
 
 QComboBox::drop-down,
@@ -364,13 +447,25 @@ QProgressBar::chunk {
     border-radius: 5px;
 }
 
+QProgressBar[compact="true"] {
+    background-color: ${surface_pressed};
+    border: none;
+    border-radius: 3px;
+    min-height: 6px;
+    max-height: 7px;
+}
+
+QProgressBar[compact="true"]::chunk {
+    border-radius: 3px;
+}
+
 QTableView,
 QTableWidget {
     background-color: ${surface_glass};
     alternate-background-color: ${surface_glass_strong};
     color: ${text};
     gridline-color: transparent;
-    border: 2px solid ${border};
+    border: 2px solid ${control_border};
     border-radius: 8px;
     selection-background-color: ${selection};
     selection-color: ${selection_text};

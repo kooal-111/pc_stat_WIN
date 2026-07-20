@@ -8,7 +8,15 @@ from pathlib import Path
 
 import psutil
 from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QResizeEvent, QShowEvent
+from PySide6.QtGui import (
+    QCloseEvent,
+    QDesktopServices,
+    QIcon,
+    QKeySequence,
+    QResizeEvent,
+    QShortcut,
+    QShowEvent,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -87,6 +95,7 @@ class MainWindow(QMainWindow):
         self._sidebar_compact = False
         self._categories_compact = False
         self._collector_error_detail: str | None = None
+        self._period_offset = 0
 
         self.setWindowTitle("PC Stat — активность")
         if window_icon is not None and not window_icon.isNull():
@@ -187,9 +196,10 @@ class MainWindow(QMainWindow):
         header_layout.addStretch(1)
 
         self._period_host = QWidget()
+        self._period_host.setObjectName("periodSegmentHost")
         period_layout = QHBoxLayout(self._period_host)
-        period_layout.setContentsMargins(0, 0, 0, 0)
-        period_layout.setSpacing(4)
+        period_layout.setContentsMargins(2, 2, 2, 2)
+        period_layout.setSpacing(2)
         self._period_group = QButtonGroup(self)
         self._period_group.setExclusive(True)
         self._period_buttons: dict[Period, QPushButton] = {}
@@ -218,6 +228,20 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_stats_page())
         self._reports = ReportsTab(self._db)
+        self._reports.navigate_requested.connect(self._shift_report_period)
+        self._reports.current_period_requested.connect(self._return_to_current_period)
+        self._report_previous_shortcut = QShortcut(
+            QKeySequence("Ctrl+Left"), self._reports
+        )
+        self._report_previous_shortcut.activated.connect(
+            partial(self._shift_report_period, -1)
+        )
+        self._report_next_shortcut = QShortcut(
+            QKeySequence("Ctrl+Right"), self._reports
+        )
+        self._report_next_shortcut.activated.connect(
+            partial(self._shift_report_period, 1)
+        )
         self._stack.addWidget(self._reports)
         self._stack.addWidget(self._build_categories_page())
         self._stack.addWidget(self._build_settings_page())
@@ -600,20 +624,53 @@ class MainWindow(QMainWindow):
         self._period_host.setVisible(index in (self.PAGE_STATS, self.PAGE_REPORTS))
         self._btn_export.setVisible(index in (self.PAGE_STATS, self.PAGE_REPORTS))
         self._reports.set_active(index == self.PAGE_REPORTS)
+        self._sync_period_labels()
         self._db.set_setting("ui_page", str(index))
         if index == self.PAGE_REPORTS:
+            self._reports.set_period_context(self._current_period, self._period_offset)
             if self._refresh_dirty:
                 self.refresh_stats(force_reports=True)
-            elif self._last_stats is not None:
-                self._reports.refresh(self._last_stats)
+            elif self._last_stats is not None and self._last_stats.chart_series:
+                self._reports.refresh(
+                    self._last_stats,
+                    self._current_period,
+                    self._period_offset,
+                )
+            else:
+                self.refresh_stats(force_reports=True)
         elif index == self.PAGE_CATEGORIES:
             self._refresh_rules_table()
+        elif self._period_offset != 0:
+            self._period_offset = 0
+            self._refresh_dirty = True
+            self._reports.set_period_context(self._current_period, 0)
+            if index == self.PAGE_STATS:
+                self.refresh_stats()
 
     def _set_period(self, period: Period) -> None:
         self._current_period = period
+        self._period_offset = 0
         self._db.set_setting("ui_period", period)
         self._sync_period_buttons()
+        self._reports.set_period_context(period, 0)
         self.refresh_stats(force_reports=self._stack.currentIndex() == self.PAGE_REPORTS)
+
+    def _shift_report_period(self, direction: int) -> None:
+        if self._stack.currentIndex() != self.PAGE_REPORTS or self._current_period == "all":
+            return
+        offset = min(0, self._period_offset + (-1 if direction < 0 else 1))
+        if offset == self._period_offset:
+            return
+        self._period_offset = offset
+        self._reports.set_period_context(self._current_period, offset)
+        self.refresh_stats(force_reports=True)
+
+    def _return_to_current_period(self) -> None:
+        if self._period_offset == 0:
+            return
+        self._period_offset = 0
+        self._reports.set_period_context(self._current_period, 0)
+        self.refresh_stats(force_reports=True)
 
     def _sync_period_buttons(self) -> None:
         for key, button in self._period_buttons.items():
@@ -626,7 +683,7 @@ class MainWindow(QMainWindow):
     def _period_bounds(self) -> tuple[float, float]:
         if self._current_period == "all":
             return period_range("all", all_start=self._db.earliest_interval_start())
-        return period_range(self._current_period)
+        return period_range(self._current_period, offset=self._period_offset)
 
     @Slot()
     def refresh_stats(self, *, force_reports: bool = False) -> None:
@@ -634,7 +691,14 @@ class MainWindow(QMainWindow):
             self._collector.flush("stats")
             q_from, q_to = self._period_bounds()
             previous = previous_period_range(self._current_period, q_from, q_to)
-            stats = self._db.period_stats(q_from, q_to, previous_range=previous)
+            reports_visible = force_reports or self._stack.currentIndex() == self.PAGE_REPORTS
+            stats = self._db.period_stats(
+                q_from,
+                q_to,
+                previous_range=previous,
+                include_chart=reports_visible,
+                chart_period=self._current_period if reports_visible else None,
+            )
         except Exception as exc:
             LOGGER.warning("Unable to refresh statistics", exc_info=True)
             self._set_collector_status(False, str(exc))
@@ -643,7 +707,7 @@ class MainWindow(QMainWindow):
         self._refresh_dirty = False
         self._apply_stats(stats)
         if force_reports or self._stack.currentIndex() == self.PAGE_REPORTS:
-            self._reports.refresh(stats)
+            self._reports.refresh(stats, self._current_period, self._period_offset)
 
     def _apply_stats(self, stats: PeriodStats) -> None:
         wall_seconds = max(0.0, stats.q_to - stats.q_from)
@@ -985,6 +1049,7 @@ class MainWindow(QMainWindow):
                 q_from,
                 q_to,
                 previous_range=previous_period_range(self._current_period, q_from, q_to),
+                include_chart=False,
             )
             export_apps_csv(self._db, q_from, q_to, path, stats)
         except (OSError, RuntimeError) as exc:
@@ -1033,18 +1098,33 @@ class MainWindow(QMainWindow):
             self._categories_inner.setMinimumHeight(590 if compact_categories else 0)
             self._rules_table.setColumnHidden(1, compact_categories)
 
+        self._sync_period_labels()
         if compact_sidebar:
             self._btn_export.setText("")
             self._btn_export.setToolTip("Экспортировать CSV")
             self._btn_export.setAccessibleName("Экспортировать CSV")
-            compact_periods = ("Сегодня", "7 дн.", "30 дн.", "Год", "Всё")
-            for button, label in zip(self._period_buttons.values(), compact_periods):
-                button.setText(label)
         else:
             self._btn_export.setText("Экспорт")
-            full_periods = ("Сегодня", "Неделя", "Месяц", "Год", "Всё")
-            for button, label in zip(self._period_buttons.values(), full_periods):
-                button.setText(label)
+
+    def _sync_period_labels(self) -> None:
+        if not hasattr(self, "_period_buttons") or not hasattr(self, "_stack"):
+            return
+        reports_page = self._stack.currentIndex() == self.PAGE_REPORTS
+        compact = getattr(self, "_sidebar_compact", False)
+        if reports_page:
+            labels = (
+                ("День", "Нед.", "Мес.", "Год", "Всё")
+                if compact
+                else ("День", "Неделя", "Месяц", "Год", "Всё")
+            )
+        else:
+            labels = (
+                ("Сегодня", "Нед.", "Мес.", "Год", "Всё")
+                if compact
+                else ("Сегодня", "Неделя", "Месяц", "Год", "Всё")
+            )
+        for button, label in zip(self._period_buttons.values(), labels):
+            button.setText(label)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)

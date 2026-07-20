@@ -61,10 +61,10 @@ class ReleaseV130Tests(unittest.TestCase):
         for requirement in ("pyside6==6.11.0", "pyinstaller==6.19.0", "pip-audit==2.10.1"):
             self.assertIn(requirement, lock)
 
-    def test_application_version_is_130(self) -> None:
+    def test_application_version_is_131(self) -> None:
         self.assertRegex(
             read("pc_stat_win/version.py"),
-            r'(?m)^APP_VERSION\s*=\s*"1\.3\.0"$',
+            r'(?m)^APP_VERSION\s*=\s*"1\.3\.1"$',
         )
 
     def test_build_is_clean_scoped_and_does_not_regenerate_icons(self) -> None:
@@ -94,6 +94,8 @@ class ReleaseV130Tests(unittest.TestCase):
             '"--workflow", "Windows CI"',
             '"ls-remote", "--exit-code", "--heads"',
             'ArgumentList "--smoke-test"',
+            ".WaitForExit(120000)",
+            "Stop-Process -Id $process.Id -Force",
             '$expectedSchemaVersion = "7"',
             "PRAGMA quick_check",
             ".FileVersion",
@@ -127,10 +129,13 @@ class ReleaseV130Tests(unittest.TestCase):
             "python -m pip install --require-hashes -r requirements-lock.txt",
             "Run release and privacy static checks",
             "python -m unittest discover -s tests -p test_release_v130.py",
+            "steps.version.outputs.version",
             "python -m unittest discover -s tests",
             "python scripts/smoke_ui_qt.py",
             ".\\scripts\\build_windows.ps1 -OneFile",
             'ArgumentList "--smoke-test"',
+            ".WaitForExit(120000)",
+            "Stop-Process -Id $process.Id -Force",
             '$expectedSchemaVersion = "7"',
             "PRAGMA quick_check",
             ".FileVersion",
@@ -144,7 +149,7 @@ class ReleaseV130Tests(unittest.TestCase):
 
     def test_readme_matches_release_version_and_single_command_flow(self) -> None:
         readme = read("README.md")
-        self.assertTrue(readme.startswith("# PC Stat 1.3.0"))
+        self.assertTrue(readme.startswith("# PC Stat 1.3.1"))
         release_section = readme.split("## Версия и выпуск", 1)[1].split("## Настройки", 1)[0]
         self.assertIn(".\\scripts\\publish_release.ps1", release_section)
         self.assertIn("schema 7", release_section)

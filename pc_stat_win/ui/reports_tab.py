@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from math import ceil
+from typing import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QMargins, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QResizeEvent
 from PySide6.QtWidgets import (
     QBoxLayout,
@@ -10,15 +12,40 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QProgressBar,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from pc_stat_win.categories import ALL_CATEGORY_KEYS, CATEGORY_COLORS, CATEGORY_LABELS_RU, OTHER
-from pc_stat_win.db import Database, PeriodStats
+from pc_stat_win.categories import (
+    ALL_CATEGORY_KEYS,
+    CATEGORY_COLORS,
+    CATEGORY_LABELS_RU,
+    OTHER,
+)
+from pc_stat_win.db import AppStat, Database, PeriodStats
 from pc_stat_win.formatting import format_duration_ms
+from pc_stat_win.periods import Period, period_title
+
+_WEEKDAYS_SHORT_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+_MONTHS_SHORT_RU = (
+    "янв.",
+    "февр.",
+    "мар.",
+    "апр.",
+    "май",
+    "июн.",
+    "июл.",
+    "авг.",
+    "сент.",
+    "окт.",
+    "нояб.",
+    "дек.",
+)
 
 
 class _CategoryRow(QWidget):
@@ -26,14 +53,14 @@ class _CategoryRow(QWidget):
         super().__init__()
         self.category = category
         row = QHBoxLayout(self)
-        row.setContentsMargins(0, 3, 0, 3)
+        row.setContentsMargins(0, 4, 0, 4)
         row.setSpacing(10)
 
         dot = QLabel()
-        dot.setObjectName("categoryDot")
         dot.setFixedSize(8, 8)
         dot.setStyleSheet(
-            f"background-color: {CATEGORY_COLORS.get(category, '#94a3b8')}; border-radius: 4px;"
+            f"background-color: {CATEGORY_COLORS.get(category, '#94a3b8')}; "
+            "border-radius: 4px;"
         )
         row.addWidget(dot)
 
@@ -42,15 +69,20 @@ class _CategoryRow(QWidget):
         row.addWidget(name)
 
         self.bar = QProgressBar()
+        self.bar.setProperty("compact", True)
         self.bar.setRange(0, 1000)
         self.bar.setTextVisible(False)
-        self.bar.setFixedHeight(8)
+        self.bar.setFixedHeight(7)
+        category_color = CATEGORY_COLORS.get(category, "#94a3b8")
+        self.bar.setStyleSheet(
+            f"QProgressBar::chunk {{ background-color: {category_color}; }}"
+        )
         row.addWidget(self.bar, 1)
 
         self.value = QLabel()
         self.value.setObjectName("secondaryText")
         self.value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.value.setMinimumWidth(145)
+        self.value.setMinimumWidth(125)
         row.addWidget(self.value)
 
     def update_value(self, duration_ms: float, total_ms: float) -> None:
@@ -59,8 +91,99 @@ class _CategoryRow(QWidget):
         self.value.setText(f"{format_duration_ms(duration_ms)}  {pct:.1f}%")
 
 
+class _UsageRow(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 7, 0, 7)
+        row.setSpacing(10)
+
+        self.dot = QLabel()
+        self.dot.setFixedSize(10, 10)
+        row.addWidget(self.dot)
+
+        content = QVBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(3)
+        self.name = QLabel()
+        self.name.setObjectName("usageName")
+        self.meta = QLabel()
+        self.meta.setObjectName("secondaryText")
+        self.bar = QProgressBar()
+        self.bar.setProperty("compact", True)
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(6)
+        content.addWidget(self.name)
+        content.addWidget(self.meta)
+        content.addWidget(self.bar)
+        row.addLayout(content, 1)
+
+        self.duration = QLabel()
+        self.duration.setObjectName("usageDuration")
+        self.duration.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.duration.setMinimumWidth(92)
+        row.addWidget(self.duration)
+
+    def update_app(self, app: AppStat, category: str, maximum_ms: float) -> None:
+        label = CATEGORY_LABELS_RU.get(category, category)
+        color = CATEGORY_COLORS.get(category, "#94a3b8")
+        self.dot.setStyleSheet(f"background-color: {color}; border-radius: 5px;")
+        self.name.setText(app.exe_name or "Неизвестное приложение")
+        self.name.setToolTip(app.exe_path)
+        self.meta.setText(label)
+        self.duration.setText(format_duration_ms(app.active_ms))
+        self.bar.setStyleSheet(
+            f"QProgressBar::chunk {{ background-color: {color}; }}"
+        )
+        pct = 1000.0 * app.active_ms / maximum_ms if maximum_ms > 0 else 0.0
+        self.bar.setValue(max(0, min(1000, int(round(pct)))))
+
+
+class _UsageList(QFrame):
+    def __init__(self, title: str, empty_text: str) -> None:
+        super().__init__()
+        self.setObjectName("glassSurface")
+        self._empty_text = empty_text
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(0)
+        heading = QLabel(title)
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+        self._empty = QLabel(empty_text)
+        self._empty.setObjectName("secondaryText")
+        self._empty.setWordWrap(True)
+        layout.addWidget(self._empty)
+        self.rows = [_UsageRow() for _ in range(5)]
+        for row in self.rows:
+            row.hide()
+            layout.addWidget(row)
+        layout.addStretch(1)
+
+    def update_apps(
+        self,
+        apps: list[AppStat],
+        resolve_category: Callable[[str], str],
+    ) -> None:
+        visible = apps[: len(self.rows)]
+        self._empty.setVisible(not visible)
+        maximum = max((app.active_ms for app in visible), default=0.0)
+        for index, row in enumerate(self.rows):
+            if index >= len(visible):
+                row.hide()
+                continue
+            app = visible[index]
+            category = app.category or resolve_category(app.exe_path)
+            row.update_app(app, category, maximum)
+            row.show()
+
+
 class ReportsTab(QWidget):
-    """Lightweight reports page. QtCharts is imported only when this page is shown."""
+    """Screen Time-style reports page with lazy QtCharts loading."""
+
+    navigate_requested = Signal(int)
+    current_period_requested = Signal()
 
     def __init__(self, db: Database) -> None:
         super().__init__()
@@ -72,6 +195,9 @@ class ReportsTab(QWidget):
         self._theme_key = "dark"
         self._text_color = QColor("#f4f7fb")
         self._muted_color = QColor("#9ca8b8")
+        self._grid_color = QColor(148, 163, 184, 45)
+        self._period: Period = "week"
+        self._period_offset = 0
 
         scroll = QScrollArea(self)
         scroll.setObjectName("pageScroll")
@@ -87,25 +213,128 @@ class ReportsTab(QWidget):
         layout.setContentsMargins(4, 4, 8, 16)
         layout.setSpacing(12)
 
-        overview = QFrame()
-        overview.setObjectName("glassSurface")
-        self._overview_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, overview)
-        self._overview_layout.setContentsMargins(16, 14, 16, 14)
-        self._active_value = self._metric(self._overview_layout, "Активное время")
-        self._coverage_value = self._metric(self._overview_layout, "Покрытие приложениями")
-        self._comparison_value = self._metric(self._overview_layout, "К прошлому периоду")
-        layout.addWidget(overview)
+        navigator = QFrame()
+        navigator.setObjectName("reportNavigator")
+        navigator_layout = QHBoxLayout(navigator)
+        navigator_layout.setContentsMargins(10, 8, 10, 8)
+        navigator_layout.setSpacing(8)
+        self._previous_button = self._navigation_button(
+            QStyle.StandardPixmap.SP_ArrowLeft,
+            "Предыдущий период",
+            -1,
+        )
+        navigator_layout.addWidget(self._previous_button)
+        self._range_label = QLabel()
+        self._range_label.setObjectName("periodRangeTitle")
+        self._range_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._range_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        navigator_layout.addWidget(self._range_label, 1)
+        self._current_button = QPushButton("К текущему")
+        self._current_button.setProperty("flatAction", True)
+        self._current_button.clicked.connect(self.current_period_requested.emit)
+        self._current_button.setAccessibleName("Вернуться к текущему периоду")
+        navigator_layout.addWidget(self._current_button)
+        self._next_button = self._navigation_button(
+            QStyle.StandardPixmap.SP_ArrowRight,
+            "Следующий период",
+            1,
+        )
+        navigator_layout.addWidget(self._next_button)
+        layout.addWidget(navigator)
+
+        summary = QFrame()
+        summary.setObjectName("screenTimeCard")
+        summary_layout = QVBoxLayout(summary)
+        summary_layout.setContentsMargins(18, 16, 18, 14)
+        summary_layout.setSpacing(8)
+
+        summary_header = QHBoxLayout()
+        summary_copy = QVBoxLayout()
+        summary_copy.setSpacing(2)
+        title = QLabel("Экранное время")
+        title.setObjectName("sectionTitle")
+        self._average_caption = QLabel("В среднем в день")
+        self._average_caption.setObjectName("secondaryText")
+        self._active_value = QLabel("—")
+        self._active_value.setObjectName("reportHeroValue")
+        summary_copy.addWidget(title)
+        summary_copy.addWidget(self._average_caption)
+        summary_copy.addWidget(self._active_value)
+        summary_header.addLayout(summary_copy, 1)
+        self._comparison_value = QLabel("Нет данных для сравнения")
+        self._comparison_value.setObjectName("comparisonText")
+        self._comparison_value.setWordWrap(True)
+        self._comparison_value.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom
+        )
+        summary_header.addWidget(self._comparison_value)
+        summary_layout.addLayout(summary_header)
+
+        self._chart_host = QWidget()
+        self._chart_host.setMinimumWidth(0)
+        self._chart_host.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._chart_layout = QVBoxLayout(self._chart_host)
+        self._chart_layout.setContentsMargins(0, 0, 0, 0)
+        self._chart_placeholder = QLabel("График появится при открытии отчёта")
+        self._chart_placeholder.setObjectName("secondaryText")
+        self._chart_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chart_placeholder.setMinimumHeight(245)
+        self._chart_layout.addWidget(self._chart_placeholder)
+        summary_layout.addWidget(self._chart_host)
+
+        self._overview_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._category_summary: list[tuple[QWidget, QLabel, QLabel, QLabel]] = []
+        for _index in range(3):
+            block = QWidget()
+            block_layout = QVBoxLayout(block)
+            block_layout.setContentsMargins(0, 0, 0, 0)
+            block_layout.setSpacing(1)
+            name_row = QHBoxLayout()
+            name_row.setContentsMargins(0, 0, 0, 0)
+            name_row.setSpacing(6)
+            dot = QLabel()
+            dot.setFixedSize(8, 8)
+            name = QLabel()
+            name.setObjectName("reportCategoryName")
+            value = QLabel()
+            value.setObjectName("reportCategoryValue")
+            name_row.addWidget(dot)
+            name_row.addWidget(name, 1)
+            block_layout.addLayout(name_row)
+            block_layout.addWidget(value)
+            self._overview_layout.addWidget(block, 1)
+            self._category_summary.append((block, dot, name, value))
+        summary_layout.addLayout(self._overview_layout)
+
+        divider = QFrame()
+        divider.setObjectName("reportDivider")
+        divider.setFixedHeight(1)
+        summary_layout.addWidget(divider)
+        footer = QHBoxLayout()
+        footer.addWidget(QLabel("Всего активного времени"))
+        footer.addStretch(1)
+        self._coverage_value = QLabel()
+        self._coverage_value.setObjectName("secondaryText")
+        footer.addWidget(self._coverage_value)
+        self._total_value = QLabel("—")
+        self._total_value.setObjectName("reportTotalValue")
+        footer.addWidget(self._total_value)
+        summary_layout.addLayout(footer)
+        layout.addWidget(summary)
 
         categories = QFrame()
         categories.setObjectName("glassSurface")
         cat_layout = QVBoxLayout(categories)
         cat_layout.setContentsMargins(16, 14, 16, 14)
         cat_layout.setSpacing(4)
-        title = QLabel("Распределение по категориям")
-        title.setObjectName("sectionTitle")
-        cat_layout.addWidget(title)
-        caption = QLabel("Доля считается от времени, покрытого приложениями в фокусе")
+        cat_title = QLabel("Категории")
+        cat_title.setObjectName("sectionTitle")
+        cat_layout.addWidget(cat_title)
+        caption = QLabel(
+            "Доля от времени, для которого определено активное приложение"
+        )
         caption.setObjectName("secondaryText")
+        caption.setWordWrap(True)
         cat_layout.addWidget(caption)
         self._category_rows: dict[str, _CategoryRow] = {}
         for category in ALL_CATEGORY_KEYS:
@@ -117,56 +346,17 @@ class ReportsTab(QWidget):
 
         self._lists_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
         self._lists_layout.setSpacing(12)
-        top_surface = QFrame()
-        top_surface.setObjectName("glassSurface")
-        top_layout = QVBoxLayout(top_surface)
-        top_layout.setContentsMargins(16, 14, 16, 14)
-        top_title = QLabel("Топ приложений")
-        top_title.setObjectName("sectionTitle")
-        top_layout.addWidget(top_title)
-        self._top_apps = QLabel()
-        self._top_apps.setWordWrap(True)
-        self._top_apps.setMinimumWidth(0)
-        self._top_apps.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self._top_apps.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        top_layout.addWidget(self._top_apps)
-        self._lists_layout.addWidget(top_surface, 1)
-
-        other_surface = QFrame()
-        other_surface.setObjectName("glassSurface")
-        other_layout = QVBoxLayout(other_surface)
-        other_layout.setContentsMargins(16, 14, 16, 14)
-        other_title = QLabel("Нужно классифицировать")
-        other_title.setObjectName("sectionTitle")
-        other_layout.addWidget(other_title)
-        self._other_apps = QLabel()
-        self._other_apps.setWordWrap(True)
-        self._other_apps.setMinimumWidth(0)
-        self._other_apps.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self._other_apps.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        other_layout.addWidget(self._other_apps)
-        self._lists_layout.addWidget(other_surface, 1)
+        self._top_apps = _UsageList(
+            "Чаще всего использовались",
+            "За выбранный период пока нет данных",
+        )
+        self._lists_layout.addWidget(self._top_apps, 1)
+        self._other_apps = _UsageList(
+            "Нужно классифицировать",
+            "Все заметные приложения уже распределены по категориям",
+        )
+        self._lists_layout.addWidget(self._other_apps, 1)
         layout.addLayout(self._lists_layout)
-
-        timeline = QFrame()
-        timeline.setObjectName("glassSurface")
-        timeline_layout = QVBoxLayout(timeline)
-        timeline_layout.setContentsMargins(12, 12, 12, 12)
-        timeline_title = QLabel("Активность за период")
-        timeline_title.setObjectName("sectionTitle")
-        timeline_layout.addWidget(timeline_title)
-        self._chart_host = QWidget()
-        self._chart_host.setMinimumWidth(0)
-        self._chart_host.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self._chart_layout = QVBoxLayout(self._chart_host)
-        self._chart_layout.setContentsMargins(0, 0, 0, 0)
-        self._chart_placeholder = QLabel("График появится при открытии отчёта")
-        self._chart_placeholder.setObjectName("secondaryText")
-        self._chart_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._chart_placeholder.setMinimumHeight(260)
-        self._chart_layout.addWidget(self._chart_placeholder)
-        timeline_layout.addWidget(self._chart_host)
-        layout.addWidget(timeline)
         layout.addStretch(1)
 
         scroll.setWidget(inner)
@@ -174,29 +364,30 @@ class ReportsTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
         self._apply_responsive_layout()
+        self.set_period_context("week", 0)
 
-    @staticmethod
-    def _metric(layout: QBoxLayout, label: str) -> QLabel:
-        block = QWidget()
-        block_layout = QVBoxLayout(block)
-        block_layout.setContentsMargins(0, 0, 0, 0)
-        name = QLabel(label)
-        name.setObjectName("secondaryText")
-        value = QLabel("—")
-        value.setObjectName("metricValue")
-        block_layout.addWidget(name)
-        block_layout.addWidget(value)
-        layout.addWidget(block, 1)
-        return value
+    def _navigation_button(
+        self,
+        icon: QStyle.StandardPixmap,
+        tooltip: str,
+        direction: int,
+    ) -> QToolButton:
+        button = QToolButton()
+        button.setProperty("reportNavigation", True)
+        button.setIcon(self.style().standardIcon(icon))
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.clicked.connect(lambda _checked=False: self.navigate_requested.emit(direction))
+        return button
 
     def _apply_responsive_layout(self) -> None:
-        direction = (
+        compact = self.width() < 860
+        self._lists_layout.setDirection(
             QBoxLayout.Direction.TopToBottom
-            if self.width() < 860
+            if compact
             else QBoxLayout.Direction.LeftToRight
         )
-        self._overview_layout.setDirection(direction)
-        self._lists_layout.setDirection(direction)
+        self._current_button.setText("Сейчас" if compact else "К текущему")
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -205,59 +396,112 @@ class ReportsTab(QWidget):
     def set_active(self, active: bool) -> None:
         self._active = active
 
+    def set_period_context(self, period: Period, offset: int) -> None:
+        self._period = period
+        self._period_offset = min(0, int(offset))
+        navigable = period != "all"
+        self._previous_button.setEnabled(navigable)
+        self._next_button.setEnabled(navigable and self._period_offset < 0)
+        self._current_button.setVisible(navigable and self._period_offset < 0)
+        if self._stats is not None:
+            self._range_label.setText(
+                period_title(period, self._stats.q_from, self._stats.q_to)
+            )
+
     def apply_chart_theme(self, theme_key: str) -> None:
         self._theme_key = theme_key
         if theme_key == "light":
             self._text_color = QColor("#172033")
             self._muted_color = QColor("#657084")
+            self._grid_color = QColor(100, 116, 139, 45)
         else:
             self._text_color = QColor("#f4f7fb")
             self._muted_color = QColor("#9ca8b8")
+            self._grid_color = QColor(148, 163, 184, 42)
         if self._chart_ready:
             self._apply_chart_palette()
 
-    def refresh(self, stats: PeriodStats) -> None:
+    def refresh(
+        self,
+        stats: PeriodStats,
+        period: Period | None = None,
+        offset: int | None = None,
+    ) -> None:
         self._stats = stats
-        self._active_value.setText(format_duration_ms(stats.pc_ms))
-        self._coverage_value.setText(f"{stats.coverage_pct:.1f}%")
-        previous = getattr(stats, "previous_pc_ms", None)
-        if previous is None:
-            self._comparison_value.setText("Нет сравнения")
+        if period is not None:
+            self.set_period_context(period, self._period_offset if offset is None else offset)
+        elif offset is not None:
+            self.set_period_context(self._period, offset)
+        self._range_label.setText(period_title(self._period, stats.q_from, stats.q_to))
+
+        day_count = self._calendar_day_count(stats.q_from, stats.q_to)
+        if self._period in ("week", "month", "year"):
+            self._average_caption.setText("В среднем в день")
+            self._active_value.setText(format_duration_ms(stats.pc_ms / day_count))
         else:
-            delta = stats.pc_ms - previous
-            sign = "+" if delta >= 0 else "−"
-            self._comparison_value.setText(f"{sign}{format_duration_ms(abs(delta))}")
+            self._average_caption.setText("Активное время")
+            self._active_value.setText(format_duration_ms(stats.pc_ms))
+        self._total_value.setText(format_duration_ms(stats.pc_ms))
+        self._coverage_value.setText(f"Покрытие {stats.coverage_pct:.1f}%  ·")
+        self._comparison_value.setText(self._comparison_text(stats))
+
+        ranked_categories = sorted(
+            (
+                (category, duration)
+                for category, duration in stats.by_category.items()
+                if duration > 0.5
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for index, (block, dot, name, value) in enumerate(self._category_summary):
+            if index >= len(ranked_categories):
+                block.hide()
+                continue
+            category, duration = ranked_categories[index]
+            name.setText(CATEGORY_LABELS_RU.get(category, category))
+            color = CATEGORY_COLORS.get(category, "#94a3b8")
+            dot.setStyleSheet(f"background-color: {color}; border-radius: 4px;")
+            value.setText(format_duration_ms(duration))
+            block.show()
 
         for key, row in self._category_rows.items():
-            ms = stats.by_category.get(key, 0.0)
-            row.setVisible(ms > 0.5)
-            if ms > 0.5:
-                row.update_value(ms, stats.app_ms)
+            duration = stats.by_category.get(key, 0.0)
+            row.setVisible(duration > 0.5)
+            if duration > 0.5:
+                row.update_value(duration, stats.app_ms)
 
-        top_lines = []
-        for index, app in enumerate(stats.apps[:5], 1):
-            category = app.category or self._db.resolve_category(app.exe_path)
-            top_lines.append(
-                f"{index}. {app.exe_name or '?'}  ·  {format_duration_ms(app.active_ms)}  ·  "
-                f"{CATEGORY_LABELS_RU.get(category, category)}"
-            )
-        self._top_apps.setText("\n".join(top_lines) if top_lines else "Пока нет данных")
-
-        other = [
+        self._top_apps.update_apps(stats.apps[:5], self._db.resolve_category)
+        unclassified = [
             app
             for app in stats.apps
             if (app.category or self._db.resolve_category(app.exe_path)) == OTHER
-        ][:5]
-        self._other_apps.setText(
-            "\n".join(
-                f"{index}. {app.exe_name or '?'}  ·  {format_duration_ms(app.active_ms)}"
-                for index, app in enumerate(other, 1)
-            )
-            if other
-            else "Все заметные приложения классифицированы"
-        )
+        ]
+        self._other_apps.update_apps(unclassified[:5], self._db.resolve_category)
         if self._active:
             self._refresh_chart()
+
+    @staticmethod
+    def _calendar_day_count(q_from: float, q_to: float) -> int:
+        if q_to <= q_from:
+            return 1
+        local_tz = datetime.now().astimezone().tzinfo
+        start = datetime.fromtimestamp(q_from, tz=local_tz).date()
+        end = datetime.fromtimestamp(
+            max(q_from, q_to - 0.001), tz=local_tz
+        ).date()
+        return max(1, (end - start).days + 1)
+
+    @staticmethod
+    def _comparison_text(stats: PeriodStats) -> str:
+        previous = stats.previous_pc_ms
+        if previous is None or previous <= 0:
+            return "Нет данных для сравнения"
+        delta_pct = 100.0 * (stats.pc_ms - previous) / previous
+        if abs(delta_pct) < 0.05:
+            return "Без изменений к прошлому периоду"
+        arrow = "↑" if delta_pct > 0 else "↓"
+        return f"{arrow} {abs(delta_pct):.0f}% к прошлому периоду"
 
     def _ensure_chart(self) -> bool:
         if self._chart_ready:
@@ -275,14 +519,15 @@ class ReportsTab(QWidget):
         self._chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
         self._chart.setBackgroundVisible(False)
         self._chart.setPlotAreaBackgroundVisible(False)
+        self._chart.setMargins(QMargins(0, 0, 0, 0))
         self._chart.legend().hide()
         self._chart_view = QChartView(self._chart)
         self._chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._chart_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._chart_view.setMinimumWidth(0)
         self._chart_view.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self._chart_view.setMinimumHeight(280)
+        self._chart_view.setMinimumHeight(255)
         self._chart_layout.removeWidget(self._chart_placeholder)
+        self._chart_placeholder.hide()
         self._chart_placeholder.deleteLater()
         self._chart_layout.addWidget(self._chart_view)
         self._chart_ready = True
@@ -297,60 +542,190 @@ class ReportsTab(QWidget):
         self._chart.setBackgroundBrush(QBrush(transparent))
         self._chart.setPlotAreaBackgroundVisible(False)
         self._chart.setPlotAreaBackgroundBrush(QBrush(transparent))
-        self._chart.setTitleBrush(QBrush(self._text_color))
         self._chart.legend().hide()
         for axis in self._chart.axes():
-            axis.setLabelsBrush(QBrush(self._text_color))
+            axis.setLabelsBrush(QBrush(self._muted_color))
             if hasattr(axis, "setTitleBrush"):
-                axis.setTitleBrush(QBrush(self._text_color))
+                axis.setTitleBrush(QBrush(self._muted_color))
             if hasattr(axis, "setGridLinePen"):
-                axis.setGridLinePen(QPen(self._muted_color, 1))
+                axis.setGridLinePen(QPen(self._grid_color, 1))
 
     def _refresh_chart(self) -> None:
         stats = self._stats
         if stats is None or not self._ensure_chart():
             return
-        from PySide6.QtCharts import QBarCategoryAxis, QBarSeries, QBarSet, QValueAxis
-
-        for axis in self._chart.axes():
-            self._chart.removeAxis(axis)
-        self._chart.removeAllSeries()
-        series_data = self._compress_series(stats.chart_series, 62)
-        if not series_data:
-            self._chart.setTitle("Нет данных для графика активности")
-            self._apply_chart_palette()
-            return
-
-        values = QBarSet("Активность, ч")
-        values.setBrush(QBrush(QColor("#2563eb")))
-        max_value = 0.0
-        labels: list[str] = []
-        label_step = max(1, ceil(len(series_data) / 16))
-        for index, (label, duration_ms) in enumerate(series_data):
-            hours = duration_ms / 3_600_000.0
-            values << hours
-            labels.append(label if index % label_step == 0 else "")
-            max_value = max(max_value, hours)
-
-        bars = QBarSeries()
-        bars.append(values)
-        self._chart.addSeries(bars)
-        self._chart.legend().hide()
-        self._chart.setTitle(
-            "Активность по часам" if stats.chart_mode == "hour" else "Активность по дням"
+        from PySide6.QtCharts import (
+            QBarCategoryAxis,
+            QBarSet,
+            QStackedBarSeries,
+            QValueAxis,
         )
 
+        for axis in self._chart.axes():
+            axis.setVisible(False)
+            self._chart.removeAxis(axis)
+            axis.deleteLater()
+        self._chart.removeAllSeries()
+        series_data, category_data = self._compressed_chart_data(stats, 62)
+        if not series_data:
+            self._chart.setTitle("Нет данных за выбранный период")
+            self._apply_chart_palette()
+            return
+        self._chart.setTitle("")
+
+        totals_by_category = sorted(
+            (
+                (category, sum(values))
+                for category, values in category_data.items()
+                if sum(values) > 0.5
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        selected = [category for category, _total in totals_by_category[:4]]
+        bars = QStackedBarSeries()
+        bars.setBarWidth(0.68)
+        stacked_totals = [0.0 for _ in series_data]
+
+        for category in selected:
+            values = category_data[category]
+            bar_set = QBarSet(CATEGORY_LABELS_RU.get(category, category))
+            bar_set.setBrush(QBrush(QColor(CATEGORY_COLORS.get(category, "#94a3b8"))))
+            for index, duration_ms in enumerate(values):
+                hours = duration_ms / 3_600_000.0
+                bar_set.append(hours)
+                stacked_totals[index] += hours
+            bars.append(bar_set)
+
+        remaining_categories = [
+            category for category, _total in totals_by_category if category not in selected
+        ]
+        if remaining_categories:
+            other_set = QBarSet("Остальные категории")
+            other_set.setBrush(QBrush(QColor("#94a3b8")))
+            for index in range(len(series_data)):
+                hours = sum(category_data[key][index] for key in remaining_categories)
+                hours /= 3_600_000.0
+                other_set.append(hours)
+                stacked_totals[index] += hours
+            bars.append(other_set)
+
+        if not selected and not remaining_categories:
+            fallback = QBarSet("Активность")
+            fallback.setBrush(QBrush(QColor("#2563eb")))
+            for index, (_label, duration_ms) in enumerate(series_data):
+                hours = duration_ms / 3_600_000.0
+                fallback.append(hours)
+                stacked_totals[index] = hours
+            bars.append(fallback)
+
+        uncovered = []
+        for index, (_label, duration_ms) in enumerate(series_data):
+            pc_hours = duration_ms / 3_600_000.0
+            uncovered.append(max(0.0, pc_hours - stacked_totals[index]))
+        if any(value > 0.001 for value in uncovered):
+            uncovered_set = QBarSet("Без приложения")
+            uncovered_set.setBrush(QBrush(QColor("#CBD5E1")))
+            for value in uncovered:
+                uncovered_set.append(value)
+            bars.append(uncovered_set)
+            stacked_totals = [
+                total + missing for total, missing in zip(stacked_totals, uncovered)
+            ]
+
+        self._chart.addSeries(bars)
+        self._chart.legend().hide()
+
+        raw_labels = [label for label, _duration in series_data]
         axis_x = QBarCategoryAxis()
-        axis_x.append(labels)
+        axis_x.append(self._axis_labels(stats.chart_mode, raw_labels, self._period))
+        axis_x.setGridLineVisible(False)
         self._chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
         bars.attachAxis(axis_x)
 
         axis_y = QValueAxis()
-        axis_y.setTitleText("Часы")
-        axis_y.setRange(0, max(0.5, max_value * 1.15))
+        maximum = max(stacked_totals, default=0.0)
+        axis_y.setRange(0, max(0.5, maximum * 1.12))
+        axis_y.setTickCount(4)
+        axis_y.setLabelFormat("%.1f")
+        axis_y.setMinorGridLineVisible(False)
         self._chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
         bars.attachAxis(axis_y)
         self._apply_chart_palette()
+
+    @staticmethod
+    def _axis_labels(mode: str, labels: list[str], period: Period) -> list[str]:
+        if not labels:
+            return []
+        result: list[str] = []
+        if mode == "hour":
+            step = max(1, ceil(len(labels) / 6))
+            for index, label in enumerate(labels):
+                hour = label.rsplit(" ", 1)[-1].split(":", 1)[0]
+                result.append(hour if index % step == 0 else "")
+            return result
+
+        if mode == "month":
+            step = max(1, ceil(len(labels) / 12))
+            for index, label in enumerate(labels):
+                try:
+                    year_text, month_text = label.split("-", 1)
+                    month = int(month_text)
+                except (TypeError, ValueError):
+                    result.append(label if index % step == 0 else "")
+                    continue
+                if period == "year" and len(labels) <= 12:
+                    result.append(_MONTHS_SHORT_RU[month - 1])
+                elif index % step == 0:
+                    result.append(
+                        str(year_text) if month == 1 else _MONTHS_SHORT_RU[month - 1]
+                    )
+                else:
+                    result.append("")
+            return result
+
+        parsed: list[datetime | None] = []
+        for label in labels:
+            try:
+                parsed.append(datetime.fromisoformat(label))
+            except (TypeError, ValueError):
+                parsed.append(None)
+        if period == "week" and len(labels) <= 8:
+            return [
+                _WEEKDAYS_SHORT_RU[value.weekday()] if value is not None else labels[index]
+                for index, value in enumerate(parsed)
+            ]
+
+        step = max(1, ceil(len(labels) / 10))
+        for index, value in enumerate(parsed):
+            if index % step != 0 and index != len(labels) - 1:
+                result.append("")
+            elif value is None:
+                result.append(labels[index])
+            else:
+                result.append(str(value.day))
+        return result
+
+    @staticmethod
+    def _compressed_chart_data(
+        stats: PeriodStats,
+        limit: int,
+    ) -> tuple[list[tuple[str, float]], dict[str, list[float]]]:
+        source = stats.chart_series
+        if len(source) <= limit:
+            return list(source), {
+                key: list(values[: len(source)])
+                for key, values in stats.chart_by_category.items()
+            }
+        chunk_size = max(1, ceil(len(source) / limit))
+        compressed: list[tuple[str, float]] = []
+        categories = {key: [] for key in stats.chart_by_category}
+        for offset in range(0, len(source), chunk_size):
+            chunk = source[offset : offset + chunk_size]
+            compressed.append((chunk[-1][0], sum(value for _label, value in chunk)))
+            for key, values in stats.chart_by_category.items():
+                categories[key].append(sum(values[offset : offset + len(chunk)]))
+        return compressed, categories
 
     @staticmethod
     def _compress_series(

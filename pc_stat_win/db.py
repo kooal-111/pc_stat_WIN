@@ -6,7 +6,7 @@ import sqlite3
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
@@ -80,6 +80,7 @@ class PeriodStats:
     chart_series: list[tuple[str, float]]
     estimated_uptime_sec: float
     previous_pc_ms: float | None = None
+    chart_by_category: dict[str, list[float]] = field(default_factory=dict)
 
     @property
     def app_ms(self) -> float:
@@ -1008,37 +1009,133 @@ class Database:
             acc[cat] += a.active_ms
         return acc
 
-    def bucket_pc_active_by_calendar_day(self, q_from: float, q_to: float) -> list[tuple[str, float]]:
-        """List of (YYYY-MM-DD, active_ms) for each calendar day overlapping the range."""
+    @staticmethod
+    def _calendar_day_slots(
+        q_from: float, q_to: float
+    ) -> list[tuple[str, float, float]]:
+        if q_to <= q_from:
+            return []
         tz = datetime.now().astimezone().tzinfo
         d0 = datetime.fromtimestamp(q_from, tz=tz).date()
-        d1 = datetime.fromtimestamp(q_to, tz=tz).date()
+        d1 = datetime.fromtimestamp(max(q_from, q_to - 0.001), tz=tz).date()
         slots: list[tuple[str, float, float]] = []
-        d = d0
-        while d <= d1:
-            day_start = datetime.combine(d, dt_time(0, 0), tzinfo=tz)
+        day = d0
+        while day <= d1:
+            day_start = datetime.combine(day, dt_time(0, 0), tzinfo=tz)
             day_end = day_start + timedelta(days=1)
-            ts0 = day_start.timestamp()
-            ts1 = day_end.timestamp()
-            slots.append((d.isoformat(), max(q_from, ts0), min(q_to, ts1)))
-            d += timedelta(days=1)
+            slots.append(
+                (
+                    day.isoformat(),
+                    max(q_from, day_start.timestamp()),
+                    min(q_to, day_end.timestamp()),
+                )
+            )
+            day += timedelta(days=1)
+        return slots
+
+    @staticmethod
+    def _hour_slots(q_from: float, q_to: float) -> list[tuple[str, float, float]]:
+        if q_to <= q_from:
+            return []
+        tz = datetime.now().astimezone().tzinfo
+        slots: list[tuple[str, float, float]] = []
+        current = q_from
+        while current < q_to:
+            hour = datetime.fromtimestamp(current, tz=tz).replace(
+                minute=0, second=0, microsecond=0
+            )
+            slot_start = hour.timestamp()
+            slot_end = slot_start + 3600.0
+            slots.append(
+                (
+                    hour.strftime("%Y-%m-%d %H:00"),
+                    max(q_from, slot_start),
+                    min(q_to, slot_end),
+                )
+            )
+            current = slot_end
+        return slots
+
+    @staticmethod
+    def _calendar_month_slots(
+        q_from: float, q_to: float
+    ) -> list[tuple[str, float, float]]:
+        if q_to <= q_from:
+            return []
+        tz = datetime.now().astimezone().tzinfo
+        current = datetime.fromtimestamp(q_from, tz=tz).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        last = datetime.fromtimestamp(max(q_from, q_to - 0.001), tz=tz)
+        slots: list[tuple[str, float, float]] = []
+        while current <= last:
+            if current.month == 12:
+                following = current.replace(year=current.year + 1, month=1)
+            else:
+                following = current.replace(month=current.month + 1)
+            slots.append(
+                (
+                    current.strftime("%Y-%m"),
+                    max(q_from, current.timestamp()),
+                    min(q_to, following.timestamp()),
+                )
+            )
+            current = following
+        return slots
+
+    @classmethod
+    def _chart_slots(
+        cls,
+        q_from: float,
+        q_to: float,
+        period: str | None = None,
+    ) -> tuple[str, list[tuple[str, float, float]]]:
+        slot_to = q_to
+        if period in ("today", "week", "month", "year"):
+            tz = datetime.now().astimezone().tzinfo
+            start = datetime.fromtimestamp(q_from, tz=tz)
+            if period == "today":
+                slot_to = max(q_to, (start + timedelta(days=1)).timestamp())
+                return "hour", cls._hour_slots(q_from, slot_to)
+            if period == "week":
+                slot_to = max(q_to, (start + timedelta(days=7)).timestamp())
+                return "day", cls._calendar_day_slots(q_from, slot_to)
+            if period == "month":
+                if start.month == 12:
+                    following = start.replace(year=start.year + 1, month=1, day=1)
+                else:
+                    following = start.replace(month=start.month + 1, day=1)
+                slot_to = max(q_to, following.timestamp())
+                return "day", cls._calendar_day_slots(q_from, slot_to)
+            following = start.replace(year=start.year + 1, month=1, day=1)
+            slot_to = max(q_to, following.timestamp())
+            return "month", cls._calendar_month_slots(q_from, slot_to)
+
+        span = q_to - q_from
+        if span <= 0:
+            return "day", []
+        if span <= 2.5 * 86400:
+            return "hour", cls._hour_slots(q_from, q_to)
+        if span <= 62 * 86400:
+            return "day", cls._calendar_day_slots(q_from, q_to)
+        return "month", cls._calendar_month_slots(q_from, q_to)
+
+    def bucket_pc_active_by_calendar_day(self, q_from: float, q_to: float) -> list[tuple[str, float]]:
+        """List of (YYYY-MM-DD, active_ms) for each calendar day overlapping the range."""
+        slots = self._calendar_day_slots(q_from, q_to)
         return self._bucket_pc_active(slots, q_from, q_to)
 
     def bucket_pc_active_by_hour_slots(
         self, q_from: float, q_to: float
     ) -> list[tuple[str, float]]:
         """Each local calendar hour in range: label 'dd HH:00' or 'YYYY-mm-dd HH:00', ms."""
-        tz = datetime.now().astimezone().tzinfo
-        slots: list[tuple[str, float, float]] = []
-        t = q_from
-        while t < q_to:
-            dt = datetime.fromtimestamp(t, tz=tz)
-            hs = dt.replace(minute=0, second=0, microsecond=0)
-            t0 = hs.timestamp()
-            t1 = t0 + 3600.0
-            label = hs.strftime("%m-%d %H:00")
-            slots.append((label, max(q_from, t0), min(q_to, t1)))
-            t = t1
+        slots = self._hour_slots(q_from, q_to)
+        return self._bucket_pc_active(slots, q_from, q_to)
+
+    def bucket_pc_active_by_calendar_month(
+        self, q_from: float, q_to: float
+    ) -> list[tuple[str, float]]:
+        slots = self._calendar_month_slots(q_from, q_to)
         return self._bucket_pc_active(slots, q_from, q_to)
 
     def _bucket_pc_active(
@@ -1078,19 +1175,62 @@ class Database:
     def chart_pc_active_series(
         self, q_from: float, q_to: float
     ) -> tuple[str, list[tuple[str, float]]]:
-        """Returns ('day'|'hour', list of (label, ms)) for charts."""
-        span = q_to - q_from
-        if span <= 0:
-            return "day", []
-        if span <= 2.5 * 86400:
-            return "hour", self.bucket_pc_active_by_hour_slots(q_from, q_to)
-        return "day", self.bucket_pc_active_by_calendar_day(q_from, q_to)
+        """Returns chart mode and active PC time for calendar-aligned slots."""
+        mode, slots = self._chart_slots(q_from, q_to)
+        return mode, self._bucket_pc_active(slots, q_from, q_to)
+
+    def _bucket_app_categories(
+        self,
+        slots: list[tuple[str, float, float]],
+        q_from: float,
+        q_to: float,
+    ) -> dict[str, list[float]]:
+        totals = {category: [0.0 for _ in slots] for category in ALL_CATEGORY_KEYS}
+        rows = self._conn.execute(
+            """
+            SELECT start_ts, end_ts, duration_ms, exe_path, exe_name
+            FROM intervals
+            WHERE kind = 'app'
+              AND start_ts < ?
+              AND end_ts > ?
+              AND end_ts > start_ts
+              AND duration_ms > 0
+            ORDER BY start_ts
+            """,
+            (q_to, q_from),
+        )
+        category_cache: dict[str, str] = {}
+        slot_i = 0
+        for row in rows:
+            start = float(row["start_ts"])
+            end = float(row["end_ts"])
+            duration = int(row["duration_ms"])
+            path = str(row["exe_path"] or row["exe_name"] or "")
+            category = category_cache.get(path)
+            if category is None:
+                category = self.resolve_category(path)
+                category_cache[path] = category
+            values = totals.setdefault(category, [0.0 for _ in slots])
+            while slot_i < len(slots) and slots[slot_i][2] <= start:
+                slot_i += 1
+            index = slot_i
+            while index < len(slots) and slots[index][1] < end:
+                _label, slot_start, slot_end = slots[index]
+                if slot_end > slot_start:
+                    values[index] += _overlap_ms(
+                        start, end, duration, slot_start, slot_end
+                    )
+                index += 1
+        return totals
 
     def period_stats(
         self,
         q_from: float,
         q_to: float,
         previous_range: tuple[float, float] | None = None,
+        *,
+        include_chart: bool = True,
+        chart_period: str | None = None,
     ) -> PeriodStats:
         pc_ms = self.total_pc_ms(q_from, q_to)
         previous_pc_ms: float | None = None
@@ -1103,7 +1243,15 @@ class Database:
         for app in apps:
             cat = app.category or self.resolve_category(app.exe_path)
             by_category[cat] = by_category.get(cat, 0.0) + app.active_ms
-        chart_mode, chart_series = self.chart_pc_active_series(q_from, q_to)
+        chart_mode = ""
+        chart_series: list[tuple[str, float]] = []
+        chart_by_category: dict[str, list[float]] = {}
+        if include_chart:
+            chart_mode, chart_slots = self._chart_slots(
+                q_from, q_to, chart_period
+            )
+            chart_series = self._bucket_pc_active(chart_slots, q_from, q_to)
+            chart_by_category = self._bucket_app_categories(chart_slots, q_from, q_to)
         return PeriodStats(
             q_from=q_from,
             q_to=q_to,
@@ -1114,6 +1262,7 @@ class Database:
             chart_series=chart_series,
             estimated_uptime_sec=self.estimated_pc_uptime_seconds(q_from, q_to),
             previous_pc_ms=previous_pc_ms,
+            chart_by_category=chart_by_category,
         )
 
     def optimize(self) -> None:

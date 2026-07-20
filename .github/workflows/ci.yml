@@ -65,6 +65,15 @@ jobs:
         run: python -m pip install --require-hashes -r requirements-lock.txt
       - name: Verify dependency environment
         run: python -m pip check
+      - name: Resolve application version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (& python scripts\generate_version_metadata.py --print-version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$') {
+              throw "Unable to resolve APP_VERSION"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
       - name: Clean onefile build
         shell: pwsh
         run: .\scripts\build_windows.ps1 -OneFile
@@ -72,7 +81,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $version = "1.3.0"
+          $version = "${{ steps.version.outputs.version }}"
           $expectedSchemaVersion = "7"
           $asset = Join-Path $PWD "dist\PCStat.exe"
           if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
@@ -92,7 +101,11 @@ jobs:
           try {
               $env:PCSTAT_DB_PATH = $smokeDb
               $env:QT_QPA_PLATFORM = "offscreen"
-              $process = Start-Process -FilePath $asset -ArgumentList "--smoke-test" -WindowStyle Hidden -Wait -PassThru
+              $process = Start-Process -FilePath $asset -ArgumentList "--smoke-test" -WindowStyle Hidden -PassThru
+              if (-not $process.WaitForExit(120000)) {
+                  Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                  throw "Packaged smoke timed out after 120 seconds"
+              }
               if ($process.ExitCode -ne 0) {
                   throw "Packaged smoke failed with exit code $($process.ExitCode)"
               }
@@ -122,7 +135,7 @@ jobs:
           subject-checksums: dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          name: PCStat-1.3.0-windows-x64
+          name: PCStat-${{ steps.version.outputs.version }}-windows-x64
           path: |
             dist/PCStat.exe
             dist/SHA256SUMS.txt

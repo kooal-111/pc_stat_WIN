@@ -79,6 +79,21 @@ def _assert_no_horizontal_overflow(window: MainWindow, page: int) -> None:
         raise AssertionError("category rules table overflows horizontally")
 
 
+def _assert_light_client_not_black(window: MainWindow) -> None:
+    image = window.grab().toImage()
+    near_black = 0
+    samples = 0
+    for y in range(0, image.height(), 8):
+        for x in range(0, image.width(), 8):
+            color = image.pixelColor(x, y)
+            samples += 1
+            if color.red() < 24 and color.green() < 24 and color.blue() < 24:
+                near_black += 1
+    ratio = near_black / max(1, samples)
+    if ratio > 0.08:
+        raise AssertionError(f"light client contains {ratio:.1%} near-black pixels")
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     with tempfile.TemporaryDirectory(prefix="pc_stat_smoke_") as tmp:
@@ -114,6 +129,8 @@ def main() -> int:
                                 f"requested {width}x{height}, got {window.width()}x{window.height()}"
                             )
                         _assert_no_horizontal_overflow(window, page)
+                        if themes.resolved_theme == "light":
+                            _assert_light_client_not_black(window)
                         if width == 760 and page == window.PAGE_STATS:
                             if window._top_surface.isVisible() or window._table.height() < 220:
                                 raise AssertionError(

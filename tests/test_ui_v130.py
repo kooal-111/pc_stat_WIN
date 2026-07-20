@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QBoxLayout, QMessageBox, QScrollArea
 from pc_stat_win.categories import BROWSER
 from pc_stat_win.collector import UsageCollector
 from pc_stat_win.db import AppStat, Database, PeriodStats
+from pc_stat_win.periods import period_range
 from pc_stat_win.ui.main_window import MainWindow
 from pc_stat_win.ui.styles import render_stylesheet, semantic_palette
 from pc_stat_win.ui.theme_manager import ThemeManager
@@ -43,6 +44,9 @@ def make_stats(count: int = 48, *, reverse: bool = False) -> PeriodStats:
         chart_series=[(f"{hour:02d}:00", 300_000.0 + hour) for hour in range(24)],
         estimated_uptime_sec=3_600.0,
         previous_pc_ms=total * 0.8,
+        chart_by_category={
+            BROWSER: [300_000.0 + hour for hour in range(24)],
+        },
     )
 
 
@@ -196,6 +200,31 @@ class MainWindowV130Tests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(refresh_chart.call_count, 1)
 
+    def test_report_period_navigation_never_enters_future(self) -> None:
+        self.window._set_period("month")
+        self.window._set_page(self.window.PAGE_REPORTS)
+        self.window._shift_report_period(-1)
+        self.assertEqual(self.window._period_offset, -1)
+        self.assertTrue(self.window._reports._next_button.isEnabled())
+
+        historical = self.window._period_bounds()
+        current = period_range("month")
+        self.assertLessEqual(historical[1], current[0])
+
+        self.window._shift_report_period(1)
+        self.window._shift_report_period(1)
+        self.assertEqual(self.window._period_offset, 0)
+        self.assertFalse(self.window._reports._next_button.isEnabled())
+
+    def test_reports_use_day_week_month_year_copy(self) -> None:
+        self.window._set_page(self.window.PAGE_REPORTS)
+        self.window.resize(1180, 760)
+        self.app.processEvents()
+        labels = [button.text() for button in self.window._period_buttons.values()]
+        self.assertEqual(labels[:4], ["День", "Неделя", "Месяц", "Год"])
+        self.assertNotIn("7 дн.", labels)
+        self.assertNotIn("30 дн.", labels)
+
     def test_report_chart_uses_transparent_surface_without_legend(self) -> None:
         reports = self.window._reports
         reports.set_active(True)
@@ -206,6 +235,9 @@ class MainWindowV130Tests(unittest.TestCase):
         self.assertFalse(reports._chart.isBackgroundVisible())
         self.assertFalse(reports._chart.isPlotAreaBackgroundVisible())
         self.assertFalse(reports._chart.legend().isVisible())
+        reports.refresh(make_stats(4))
+        self.app.processEvents()
+        self.assertEqual(len(reports._chart.axes()), 2)
 
     def test_close_without_close_to_tray_requests_application_quit(self) -> None:
         self.window._tray_available = True
