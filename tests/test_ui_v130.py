@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QBoxLayout, QFileDialog, QMessageBox
 from pc_stat_win.categories import BROWSER
 from pc_stat_win.collector import UsageCollector
 from pc_stat_win.db import AppStat, Database, PeriodStats
+from pc_stat_win.formatting import format_duration_seconds
 from pc_stat_win.periods import period_range
 from pc_stat_win.ui.main_window import MainWindow
 from pc_stat_win.ui.styles import render_stylesheet, semantic_palette
@@ -136,6 +137,72 @@ class MainWindowV130Tests(unittest.TestCase):
         self.assertEqual(self.window._selected_app().exe_path, target_path)
         self.assertEqual(vertical.value(), expected_vertical)
         self.assertEqual(horizontal.value(), expected_horizontal)
+
+    def test_refresh_stats_uses_live_snapshot_without_forcing_flush(self) -> None:
+        stats = make_stats(3)
+        live_snapshot = object()
+        self.collector.flush = Mock()
+        self.collector.live_intervals_snapshot = Mock(return_value=(live_snapshot,))
+
+        with patch.object(self.db, "period_stats", return_value=stats) as period_stats:
+            self.window.refresh_stats()
+
+        self.collector.flush.assert_not_called()
+        self.collector.live_intervals_snapshot.assert_called_once_with()
+        self.assertEqual(period_stats.call_args.kwargs["extra_intervals"], (live_snapshot,))
+
+    def test_apply_stats_uses_cached_boot_time(self) -> None:
+        self.window._boot_time = 1_000.0
+        with patch(
+            "pc_stat_win.ui.main_window.psutil.boot_time",
+            side_effect=AssertionError("boot_time should be cached"),
+        ), patch("pc_stat_win.ui.main_window.time.time", return_value=4_600.0):
+            self.window._apply_stats(make_stats(1))
+
+        self.assertEqual(
+            self.window._kpi_labels["session"].text(),
+            format_duration_seconds(3_600.0),
+        )
+
+    def test_visual_transitions_survive_fast_page_and_theme_changes(self) -> None:
+        self.window.resize(1180, 620)
+        self.window.show()
+        self.app.processEvents()
+
+        self.window._set_page(self.window.PAGE_REPORTS)
+        self.window._set_page(self.window.PAGE_SETTINGS)
+        self.window.apply_theme("dark")
+
+        self.assertEqual(self.window._stack.currentIndex(), self.window.PAGE_SETTINGS)
+        self.assertIsNotNone(self.window._page_fade_animation)
+        self.assertIsNotNone(self.window._theme_fade_animation)
+
+        current_page = self.window._stack.currentWidget()
+        central = self.window.centralWidget()
+        self.window._finish_visual_transitions()
+        self.assertIsNone(self.window._page_fade_animation)
+        self.assertIsNone(self.window._theme_fade_animation)
+        self.assertIsNone(current_page.graphicsEffect())
+        self.assertIsNone(central.graphicsEffect())
+
+    def test_top_progress_bars_use_compact_style(self) -> None:
+        for _name, _duration, bar in self.window._top_rows:
+            self.assertTrue(bar.property("compact"))
+
+    def test_report_header_reflows_on_narrow_width(self) -> None:
+        reports = self.window._reports
+        reports.resize(740, 620)
+        reports._apply_responsive_layout()
+        self.assertEqual(
+            reports._summary_header.direction(),
+            QBoxLayout.Direction.TopToBottom,
+        )
+        reports.resize(900, 620)
+        reports._apply_responsive_layout()
+        self.assertEqual(
+            reports._summary_header.direction(),
+            QBoxLayout.Direction.LeftToRight,
+        )
 
     def test_status_repolish_contract_and_tooltip_cleanup(self) -> None:
         self.collector.error_occurred.emit("database is locked")
@@ -359,7 +426,9 @@ class ThemeV130Tests(unittest.TestCase):
             self.app.palette().color(QPalette.ColorRole.Window),
             QColor(colors["window"]),
         )
-        self.assertEqual(colors["success"], "#137333")
+        self.assertEqual(colors["success"], "#16803A")
+        self.assertIn("selection_soft", colors)
+        self.assertIn("selection_strong", colors)
         self.assertNotIn("QCheckBox::indicator", render_stylesheet("light"))
 
         manager.set_mode("dark")

@@ -10,6 +10,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
+os.environ.setdefault("PCSTAT_DISABLE_ANIMATIONS", "1")
+windows_fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+if windows_fonts.exists():
+    os.environ.setdefault("QT_QPA_FONTDIR", str(windows_fonts))
 if os.environ.get("PCSTAT_UI_NATIVE", "").strip() != "1":
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 if str(ROOT) not in sys.path:
@@ -100,6 +104,13 @@ def _settle(app: QApplication, cycles: int = 8) -> None:
 
 
 def _save_window(window: MainWindow, path: Path) -> None:
+    finish_transitions = getattr(window, "_finish_visual_transitions", None)
+    if callable(finish_transitions):
+        finish_transitions()
+    reports = getattr(window, "_reports", None)
+    stop_report_fade = getattr(reports, "_stop_summary_fade", None)
+    if callable(stop_report_fade):
+        stop_report_fade()
     _settle(QApplication.instance())
     pixmap = window.grab()
     if pixmap.isNull() or not pixmap.save(str(path), "PNG"):

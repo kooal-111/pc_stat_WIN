@@ -145,6 +145,7 @@ def main() -> int:
                 collector,
                 window_icon=icon,
                 tray_available=tray_available,
+                boot_time=boot_time,
             )
             manager.register_window(window)
             window.theme_changed.connect(manager.set_mode)

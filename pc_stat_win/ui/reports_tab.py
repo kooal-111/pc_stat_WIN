@@ -4,18 +4,18 @@ from datetime import datetime
 from math import ceil
 from typing import Callable
 
-from PySide6.QtCore import QMargins, Qt, Signal
+from PySide6.QtCore import QEasingCurve, QMargins, QPropertyAnimation, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QResizeEvent
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -23,13 +23,13 @@ from PySide6.QtWidgets import (
 
 from pc_stat_win.categories import (
     ALL_CATEGORY_KEYS,
-    CATEGORY_COLORS,
     CATEGORY_LABELS_RU,
     OTHER,
 )
 from pc_stat_win.db import AppStat, Database, PeriodStats
 from pc_stat_win.formatting import format_duration_ms
 from pc_stat_win.periods import Period, period_title
+from pc_stat_win.ui.styles import semantic_palette
 
 _WEEKDAYS_SHORT_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 _MONTHS_SHORT_RU = (
@@ -47,6 +47,50 @@ _MONTHS_SHORT_RU = (
     "дек.",
 )
 
+_REPORT_CATEGORY_COLORS = {
+    "light": {
+        "work": "#2563EB",
+        "distraction": "#DC2626",
+        "communication": "#0891B2",
+        "games": "#7C3AED",
+        "media": "#D97706",
+        "devtools": "#059669",
+        "system": "#64748B",
+        "browser": "#0E7490",
+        "office_docs": "#0D9488",
+        "creative": "#BE185D",
+        "remote_access": "#6D28D9",
+        "files": "#65A30D",
+        "ai_tools": "#4F46E5",
+        "other": "#94A3B8",
+    },
+    "dark": {
+        "work": "#60A5FA",
+        "distraction": "#F87171",
+        "communication": "#22D3EE",
+        "games": "#A78BFA",
+        "media": "#FBBF24",
+        "devtools": "#34D399",
+        "system": "#94A3B8",
+        "browser": "#67E8F9",
+        "office_docs": "#2DD4BF",
+        "creative": "#F472B6",
+        "remote_access": "#C4B5FD",
+        "files": "#A3E635",
+        "ai_tools": "#818CF8",
+        "other": "#94A3B8",
+    },
+}
+_REPORT_FADE_MS = 125
+
+
+def _report_category_color(category: str, theme_key: str) -> str:
+    theme = "light" if theme_key == "light" else "dark"
+    return _REPORT_CATEGORY_COLORS[theme].get(
+        category,
+        _REPORT_CATEGORY_COLORS[theme]["other"],
+    )
+
 
 class _CategoryRow(QWidget):
     def __init__(self, category: str) -> None:
@@ -56,13 +100,9 @@ class _CategoryRow(QWidget):
         row.setContentsMargins(0, 4, 0, 4)
         row.setSpacing(10)
 
-        dot = QLabel()
-        dot.setFixedSize(8, 8)
-        dot.setStyleSheet(
-            f"background-color: {CATEGORY_COLORS.get(category, '#94a3b8')}; "
-            "border-radius: 4px;"
-        )
-        row.addWidget(dot)
+        self.dot = QLabel()
+        self.dot.setFixedSize(8, 8)
+        row.addWidget(self.dot)
 
         name = QLabel(CATEGORY_LABELS_RU.get(category, category))
         name.setMinimumWidth(130)
@@ -73,10 +113,6 @@ class _CategoryRow(QWidget):
         self.bar.setRange(0, 1000)
         self.bar.setTextVisible(False)
         self.bar.setFixedHeight(7)
-        category_color = CATEGORY_COLORS.get(category, "#94a3b8")
-        self.bar.setStyleSheet(
-            f"QProgressBar::chunk {{ background-color: {category_color}; }}"
-        )
         row.addWidget(self.bar, 1)
 
         self.value = QLabel()
@@ -85,7 +121,12 @@ class _CategoryRow(QWidget):
         self.value.setMinimumWidth(125)
         row.addWidget(self.value)
 
-    def update_value(self, duration_ms: float, total_ms: float) -> None:
+    def update_value(self, duration_ms: float, total_ms: float, theme_key: str) -> None:
+        color = _report_category_color(self.category, theme_key)
+        self.dot.setStyleSheet(f"background-color: {color}; border-radius: 4px;")
+        self.bar.setStyleSheet(
+            f"QProgressBar::chunk {{ background-color: {color}; }}"
+        )
         pct = 100.0 * duration_ms / total_ms if total_ms > 0 else 0.0
         self.bar.setValue(max(0, min(1000, int(round(pct * 10)))))
         self.value.setText(f"{format_duration_ms(duration_ms)}  {pct:.1f}%")
@@ -125,9 +166,15 @@ class _UsageRow(QWidget):
         self.duration.setMinimumWidth(92)
         row.addWidget(self.duration)
 
-    def update_app(self, app: AppStat, category: str, maximum_ms: float) -> None:
+    def update_app(
+        self,
+        app: AppStat,
+        category: str,
+        maximum_ms: float,
+        theme_key: str,
+    ) -> None:
         label = CATEGORY_LABELS_RU.get(category, category)
-        color = CATEGORY_COLORS.get(category, "#94a3b8")
+        color = _report_category_color(category, theme_key)
         self.dot.setStyleSheet(f"background-color: {color}; border-radius: 5px;")
         self.name.setText(app.exe_name or "Неизвестное приложение")
         self.name.setToolTip(app.exe_path)
@@ -165,6 +212,7 @@ class _UsageList(QFrame):
         self,
         apps: list[AppStat],
         resolve_category: Callable[[str], str],
+        theme_key: str,
     ) -> None:
         visible = apps[: len(self.rows)]
         self._empty.setVisible(not visible)
@@ -175,7 +223,7 @@ class _UsageList(QFrame):
                 continue
             app = visible[index]
             category = app.category or resolve_category(app.exe_path)
-            row.update_app(app, category, maximum)
+            row.update_app(app, category, maximum, theme_key)
             row.show()
 
 
@@ -196,6 +244,10 @@ class ReportsTab(QWidget):
         self._text_color = QColor("#f4f7fb")
         self._muted_color = QColor("#9ca8b8")
         self._grid_color = QColor(148, 163, 184, 45)
+        self._fallback_bar_color = QColor("#22d3ee")
+        self._uncovered_color = QColor("#94a3b8")
+        self._summary_fade_animation: QPropertyAnimation | None = None
+        self._summary_fade_effect: QGraphicsOpacityEffect | None = None
         self._period: Period = "week"
         self._period_offset = 0
 
@@ -219,7 +271,7 @@ class ReportsTab(QWidget):
         navigator_layout.setContentsMargins(10, 8, 10, 8)
         navigator_layout.setSpacing(8)
         self._previous_button = self._navigation_button(
-            QStyle.StandardPixmap.SP_ArrowLeft,
+            "‹",
             "Предыдущий период",
             -1,
         )
@@ -235,7 +287,7 @@ class ReportsTab(QWidget):
         self._current_button.setAccessibleName("Вернуться к текущему периоду")
         navigator_layout.addWidget(self._current_button)
         self._next_button = self._navigation_button(
-            QStyle.StandardPixmap.SP_ArrowRight,
+            "›",
             "Следующий период",
             1,
         )
@@ -248,7 +300,9 @@ class ReportsTab(QWidget):
         summary_layout.setContentsMargins(18, 16, 18, 14)
         summary_layout.setSpacing(8)
 
-        summary_header = QHBoxLayout()
+        self._summary = summary
+        summary_header = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._summary_header = summary_header
         summary_copy = QVBoxLayout()
         summary_copy.setSpacing(2)
         title = QLabel("Экранное время")
@@ -368,13 +422,13 @@ class ReportsTab(QWidget):
 
     def _navigation_button(
         self,
-        icon: QStyle.StandardPixmap,
+        symbol: str,
         tooltip: str,
         direction: int,
     ) -> QToolButton:
         button = QToolButton()
         button.setProperty("reportNavigation", True)
-        button.setIcon(self.style().standardIcon(icon))
+        button.setText(symbol)
         button.setToolTip(tooltip)
         button.setAccessibleName(tooltip)
         button.clicked.connect(lambda _checked=False: self.navigate_requested.emit(direction))
@@ -387,6 +441,18 @@ class ReportsTab(QWidget):
             if compact
             else QBoxLayout.Direction.LeftToRight
         )
+        compact_header = self.width() < 760
+        self._summary_header.setDirection(
+            QBoxLayout.Direction.TopToBottom
+            if compact_header
+            else QBoxLayout.Direction.LeftToRight
+        )
+        comparison_alignment = (
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            if compact_header
+            else Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom
+        )
+        self._comparison_value.setAlignment(comparison_alignment)
         self._current_button.setText("Сейчас" if compact else "К текущему")
 
     def resizeEvent(self, event: QResizeEvent) -> None:
@@ -410,14 +476,14 @@ class ReportsTab(QWidget):
 
     def apply_chart_theme(self, theme_key: str) -> None:
         self._theme_key = theme_key
-        if theme_key == "light":
-            self._text_color = QColor("#172033")
-            self._muted_color = QColor("#657084")
-            self._grid_color = QColor(100, 116, 139, 45)
-        else:
-            self._text_color = QColor("#f4f7fb")
-            self._muted_color = QColor("#9ca8b8")
-            self._grid_color = QColor(148, 163, 184, 42)
+        palette = semantic_palette(theme_key)
+        self._text_color = QColor(palette["text"])
+        self._muted_color = QColor(palette["text_muted"])
+        self._grid_color = QColor(palette["tone_slate"])
+        self._grid_color.setAlpha(48 if theme_key == "light" else 54)
+        self._fallback_bar_color = QColor(palette["accent"])
+        self._uncovered_color = QColor(palette["tone_slate"])
+        self._uncovered_color.setAlpha(150 if theme_key == "light" else 125)
         if self._chart_ready:
             self._apply_chart_palette()
 
@@ -460,7 +526,7 @@ class ReportsTab(QWidget):
                 continue
             category, duration = ranked_categories[index]
             name.setText(CATEGORY_LABELS_RU.get(category, category))
-            color = CATEGORY_COLORS.get(category, "#94a3b8")
+            color = _report_category_color(category, self._theme_key)
             dot.setStyleSheet(f"background-color: {color}; border-radius: 4px;")
             value.setText(format_duration_ms(duration))
             block.show()
@@ -469,17 +535,56 @@ class ReportsTab(QWidget):
             duration = stats.by_category.get(key, 0.0)
             row.setVisible(duration > 0.5)
             if duration > 0.5:
-                row.update_value(duration, stats.app_ms)
+                row.update_value(duration, stats.app_ms, self._theme_key)
 
-        self._top_apps.update_apps(stats.apps[:5], self._db.resolve_category)
+        self._top_apps.update_apps(stats.apps[:5], self._db.resolve_category, self._theme_key)
         unclassified = [
             app
             for app in stats.apps
             if (app.category or self._db.resolve_category(app.exe_path)) == OTHER
         ]
-        self._other_apps.update_apps(unclassified[:5], self._db.resolve_category)
+        self._other_apps.update_apps(
+            unclassified[:5],
+            self._db.resolve_category,
+            self._theme_key,
+        )
         if self._active:
             self._refresh_chart()
+            self._fade_summary()
+
+    def _fade_summary(self) -> None:
+        if not self.isVisible():
+            return
+        self._stop_summary_fade()
+        effect = QGraphicsOpacityEffect(self._summary)
+        effect.setOpacity(0.90)
+        self._summary.setGraphicsEffect(effect)
+        animation = QPropertyAnimation(effect, b"opacity", self._summary)
+        animation.setDuration(_REPORT_FADE_MS)
+        animation.setStartValue(0.90)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def cleanup() -> None:
+            if self._summary.graphicsEffect() is effect:
+                self._summary.setGraphicsEffect(None)
+            if self._summary_fade_animation is animation:
+                self._summary_fade_animation = None
+            if self._summary_fade_effect is effect:
+                self._summary_fade_effect = None
+
+        animation.finished.connect(cleanup)
+        self._summary_fade_animation = animation
+        self._summary_fade_effect = effect
+        animation.start()
+
+    def _stop_summary_fade(self) -> None:
+        if self._summary_fade_animation is not None:
+            self._summary_fade_animation.stop()
+        if self._summary.graphicsEffect() is self._summary_fade_effect:
+            self._summary.setGraphicsEffect(None)
+        self._summary_fade_animation = None
+        self._summary_fade_effect = None
 
     @staticmethod
     def _calendar_day_count(q_from: float, q_to: float) -> int:
@@ -590,7 +695,7 @@ class ReportsTab(QWidget):
         for category in selected:
             values = category_data[category]
             bar_set = QBarSet(CATEGORY_LABELS_RU.get(category, category))
-            bar_set.setBrush(QBrush(QColor(CATEGORY_COLORS.get(category, "#94a3b8"))))
+            bar_set.setBrush(QBrush(QColor(_report_category_color(category, self._theme_key))))
             for index, duration_ms in enumerate(values):
                 hours = duration_ms / 3_600_000.0
                 bar_set.append(hours)
@@ -602,7 +707,7 @@ class ReportsTab(QWidget):
         ]
         if remaining_categories:
             other_set = QBarSet("Остальные категории")
-            other_set.setBrush(QBrush(QColor("#94a3b8")))
+            other_set.setBrush(QBrush(QColor(_report_category_color(OTHER, self._theme_key))))
             for index in range(len(series_data)):
                 hours = sum(category_data[key][index] for key in remaining_categories)
                 hours /= 3_600_000.0
@@ -612,7 +717,7 @@ class ReportsTab(QWidget):
 
         if not selected and not remaining_categories:
             fallback = QBarSet("Активность")
-            fallback.setBrush(QBrush(QColor("#2563eb")))
+            fallback.setBrush(QBrush(self._fallback_bar_color))
             for index, (_label, duration_ms) in enumerate(series_data):
                 hours = duration_ms / 3_600_000.0
                 fallback.append(hours)
@@ -625,7 +730,7 @@ class ReportsTab(QWidget):
             uncovered.append(max(0.0, pc_hours - stacked_totals[index]))
         if any(value > 0.001 for value in uncovered):
             uncovered_set = QBarSet("Без приложения")
-            uncovered_set.setBrush(QBrush(QColor("#CBD5E1")))
+            uncovered_set.setBrush(QBrush(self._uncovered_color))
             for value in uncovered:
                 uncovered_set.append(value)
             bars.append(uncovered_set)

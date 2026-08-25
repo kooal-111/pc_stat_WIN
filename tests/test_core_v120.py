@@ -156,7 +156,10 @@ class DatabaseV120Tests(unittest.TestCase):
                     "PRAGMA index_info(idx_intervals_kind_start)"
                 )
             ]
-            self.assertEqual(indexes, {"idx_intervals_kind_start"})
+            self.assertEqual(
+                indexes,
+                {"idx_intervals_kind_start", "idx_intervals_kind_end_start"},
+            )
             self.assertEqual(columns, ["kind", "start_ts"])
             self.assertEqual(db._conn.execute("PRAGMA synchronous").fetchone()[0], 1)
             db.close()

@@ -3,9 +3,9 @@
 QWidget {
     background-color: transparent;
     color: ${text};
-    font-family: "Segoe UI Variable", "Segoe UI";
+    font-family: "Segoe UI Variable", "Segoe UI", "Arial", "Tahoma", "Microsoft Sans Serif";
     font-size: 13px;
-    selection-background-color: ${selection};
+    selection-background-color: ${selection_strong};
     selection-color: ${selection_text};
 }
 
@@ -46,6 +46,11 @@ QFrame#navigationSurface {
     border-radius: 8px;
 }
 
+QFrame#glassSurface[elevated="true"] {
+    background-color: ${surface_glass_strong};
+    border-color: ${border_strong};
+}
+
 QWidget#pageContent,
 QScrollArea#pageScroll,
 QScrollArea#pageScroll > QWidget > QWidget {
@@ -78,6 +83,35 @@ QFrame#metricBlock {
     border: 1px solid ${border};
     border-left: 3px solid ${accent};
     border-radius: 8px;
+}
+
+QFrame#metricBlock:hover {
+    background-color: ${surface_hover};
+    border-color: ${border_strong};
+}
+
+QFrame#metricBlock[metricTone="blue"] {
+    border-left: 3px solid ${tone_blue};
+}
+
+QFrame#metricBlock[metricTone="teal"] {
+    border-left: 3px solid ${tone_teal};
+}
+
+QFrame#metricBlock[metricTone="violet"] {
+    border-left: 3px solid ${tone_violet};
+}
+
+QFrame#metricBlock[metricTone="amber"] {
+    border-left: 3px solid ${tone_amber};
+}
+
+QFrame#metricBlock[metricTone="rose"] {
+    border-left: 3px solid ${tone_rose};
+}
+
+QFrame#metricBlock[metricTone="slate"] {
+    border-left: 3px solid ${tone_slate};
 }
 
 QFrame#screenTimeCard,
@@ -177,6 +211,7 @@ QFrame#reportDivider {
 QLabel#statusOk {
     color: ${success};
     background-color: ${success_bg};
+    border: 1px solid ${success};
     border-radius: 6px;
     padding: 4px 6px;
 }
@@ -184,6 +219,7 @@ QLabel#statusOk {
 QLabel#statusError {
     color: ${danger};
     background-color: ${danger_bg};
+    border: 1px solid ${danger};
     border-radius: 6px;
     padding: 4px 6px;
 }
@@ -314,9 +350,10 @@ QPushButton[navigation="true"]:hover {
 }
 
 QPushButton[navigation="true"]:checked {
-    background-color: ${selection};
+    background-color: ${selection_strong};
     border-color: ${border_strong};
     color: ${text};
+    font-weight: 700;
 }
 
 QPushButton[navigation="true"]:checked:focus {
@@ -426,8 +463,13 @@ QMenu {
     border: 1px solid ${border_strong};
     border-radius: 8px;
     padding: 4px;
-    selection-background-color: ${selection};
+    selection-background-color: ${selection_strong};
     selection-color: ${selection_text};
+}
+
+QComboBox QAbstractItemView::item {
+    min-height: 30px;
+    padding: 4px 8px;
 }
 
 QMenu::item {
@@ -437,7 +479,7 @@ QMenu::item {
 }
 
 QMenu::item:selected {
-    background-color: ${selection};
+    background-color: ${selection_strong};
 }
 
 QCheckBox {
@@ -486,13 +528,18 @@ QTableWidget {
     gridline-color: transparent;
     border: 2px solid ${control_border};
     border-radius: 8px;
-    selection-background-color: ${selection};
+    selection-background-color: ${selection_strong};
     selection-color: ${selection_text};
 }
 
 QTableView:focus,
 QTableWidget:focus {
     border: 2px solid ${accent};
+}
+
+QTableView:hover,
+QTableWidget:hover {
+    border-color: ${control_border_strong};
 }
 
 QTableView::item,
@@ -509,7 +556,7 @@ QTableWidget::item:hover {
 
 QTableView::item:selected,
 QTableWidget::item:selected {
-    background-color: ${selection};
+    background-color: ${selection_strong};
     color: ${selection_text};
 }
 
@@ -521,6 +568,24 @@ QHeaderView::section {
     min-height: 36px;
     padding: 0 8px;
     font-weight: 600;
+}
+
+QToolButton[reportNavigation="true"] {
+    background-color: ${surface_inner};
+    border-color: ${border};
+    color: ${text};
+    font-size: 24px;
+    font-weight: 700;
+    padding: 0;
+}
+
+QToolButton[reportNavigation="true"]:hover {
+    background-color: ${accent_soft};
+    border-color: ${accent};
+}
+
+QToolButton[reportNavigation="true"]:disabled {
+    color: ${text_disabled};
 }
 
 QScrollBar:vertical,
@@ -545,6 +610,11 @@ QScrollBar::handle:horizontal {
     border-radius: 6px;
     min-height: 30px;
     min-width: 30px;
+}
+
+QScrollBar::handle:vertical:hover,
+QScrollBar::handle:horizontal:hover {
+    background-color: ${control_border_strong};
 }
 
 QScrollBar::add-line,

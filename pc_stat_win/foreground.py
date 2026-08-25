@@ -58,7 +58,11 @@ def _process_identity(pid: int, hwnd: int, now: float) -> _ProcessIdentity | Non
     return identity
 
 
-def get_foreground_app(*, monotonic_clock=time.monotonic) -> ForegroundInfo | None:
+def get_foreground_app(
+    *,
+    monotonic_clock=time.monotonic,
+    include_window_title: bool = True,
+) -> ForegroundInfo | None:
     try:
         hwnd = win32gui.GetForegroundWindow()
     except win32gui.error:
@@ -71,10 +75,12 @@ def get_foreground_app(*, monotonic_clock=time.monotonic) -> ForegroundInfo | No
         return None
     if pid <= 0:
         return None
-    try:
-        title = win32gui.GetWindowText(hwnd) or ""
-    except win32gui.error:
-        title = ""
+    title = ""
+    if include_window_title:
+        try:
+            title = win32gui.GetWindowText(hwnd) or ""
+        except win32gui.error:
+            title = ""
     identity = _process_identity(int(pid), int(hwnd), monotonic_clock())
     if identity is None:
         return None

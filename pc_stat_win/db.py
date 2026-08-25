@@ -107,6 +107,7 @@ class Database:
         self._conn = sqlite3.connect(str(path))
         self._conn.row_factory = sqlite3.Row
         self._category_rules_cache: list[sqlite3.Row] | None = None
+        self._normalized_category_rules_cache: list[tuple[str, str, str]] | None = None
         try:
             self._init_schema()
         except Exception:
@@ -162,6 +163,8 @@ class Database:
                 with self.transaction() as tx:
                     self._set_schema_version(tx, 1)
             self._apply_migrations()
+            self._create_final_indexes(conn)
+            conn.commit()
         self.apply_retention_policy()
 
     def _create_schema_v7(self) -> None:
@@ -225,6 +228,13 @@ class Database:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_intervals_kind_start "
             "ON intervals (kind, start_ts)"
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_intervals_kind_end_start
+            ON intervals (kind, end_ts, start_ts)
+            WHERE end_ts > start_ts AND duration_ms > 0
+            """
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_app_cat_rules_prio "
@@ -317,6 +327,7 @@ class Database:
         return (self.get_setting("collect_window_titles", "0") or "0") == "1"
 
     def set_collect_window_titles(self, enabled: bool) -> None:
+        removed_titles = 0
         with self.transaction() as conn:
             conn.execute(
                 """
@@ -326,11 +337,16 @@ class Database:
                 ("1" if enabled else "0",),
             )
             if not enabled:
-                conn.execute(
-                    "UPDATE intervals SET window_title = NULL "
-                    "WHERE window_title IS NOT NULL"
+                removed_titles = max(
+                    0,
+                    int(
+                        conn.execute(
+                            "UPDATE intervals SET window_title = NULL "
+                            "WHERE window_title IS NOT NULL"
+                        ).rowcount
+                    ),
                 )
-        if not enabled:
+        if removed_titles:
             self._compact_private_data()
 
     def get_retention_days(self) -> int:
@@ -369,11 +385,14 @@ class Database:
         with self.transaction() as conn:
             interval_count = conn.execute("DELETE FROM intervals").rowcount
             boot_count = conn.execute("DELETE FROM boot_log").rowcount
-            conn.execute(
-                "DELETE FROM sqlite_sequence WHERE name IN ('intervals', 'boot_log')"
-            )
-        self._compact_private_data()
-        return max(0, int(interval_count)) + max(0, int(boot_count))
+            if interval_count or boot_count:
+                conn.execute(
+                    "DELETE FROM sqlite_sequence WHERE name IN ('intervals', 'boot_log')"
+                )
+        deleted = max(0, int(interval_count)) + max(0, int(boot_count))
+        if deleted:
+            self._compact_private_data()
+        return deleted
 
     def _compact_private_data(self) -> None:
         """Remove deleted payloads from the main DB and the WAL."""
@@ -561,10 +580,53 @@ class Database:
             )
             return True
 
-    def total_pc_ms(self, q_from: float, q_to: float) -> float:
+    @staticmethod
+    def _replacement_filter(
+        kind: str,
+        extra_intervals: Sequence[BufferedInterval] | None,
+    ) -> tuple[str, list[int]]:
+        if not extra_intervals:
+            return "", []
+        row_ids = sorted(
+            {
+                int(interval.row_id)
+                for interval in extra_intervals
+                if interval.kind == kind and interval.row_id is not None
+            }
+        )
+        if not row_ids:
+            return "", []
+        placeholders = ",".join("?" for _ in row_ids)
+        return f" AND id NOT IN ({placeholders})", row_ids
+
+    @staticmethod
+    def _extra_intervals(
+        extra_intervals: Sequence[BufferedInterval] | None,
+        kind: str,
+        q_from: float,
+        q_to: float,
+    ) -> Iterator[BufferedInterval]:
+        for interval in extra_intervals or ():
+            if interval.kind != kind:
+                continue
+            if interval.duration_ms <= 0 or interval.end_ts <= interval.start_ts:
+                continue
+            if interval.start_ts < q_to and interval.end_ts > q_from:
+                yield interval
+
+    def total_pc_ms(
+        self,
+        q_from: float,
+        q_to: float,
+        *,
+        extra_intervals: Sequence[BufferedInterval] | None = None,
+    ) -> float:
         total = 0.0
+        replacement_sql, replacement_params = self._replacement_filter(
+            "pc_active", extra_intervals
+        )
         for row in self._conn.execute(
-            """
+            f"""
             SELECT start_ts, end_ts, duration_ms
             FROM intervals
             WHERE kind = 'pc_active'
@@ -572,8 +634,9 @@ class Database:
               AND end_ts > ?
               AND end_ts > start_ts
               AND duration_ms > 0
+              {replacement_sql}
             """,
-            (q_to, q_from),
+            (q_to, q_from, *replacement_params),
         ):
             total += _overlap_ms(
                 float(row["start_ts"]),
@@ -582,15 +645,37 @@ class Database:
                 q_from,
                 q_to,
             )
+        for interval in self._extra_intervals(extra_intervals, "pc_active", q_from, q_to):
+            total += _overlap_ms(
+                interval.start_ts,
+                interval.end_ts,
+                interval.duration_ms,
+                q_from,
+                q_to,
+            )
         return total
 
     def estimated_pc_uptime_seconds(self, q_from: float, q_to: float) -> float:
         """Estimate uptime without counting offline gaps between recorded boots."""
+        if q_to <= q_from:
+            return 0.0
         rows = self._conn.execute(
             """
-            SELECT boot_ts, logged_at, last_seen_ts
-            FROM boot_log ORDER BY boot_ts ASC, id ASC
-            """
+            SELECT id, boot_ts, logged_at, last_seen_ts
+            FROM boot_log
+            WHERE boot_ts < ?
+              AND (
+                coalesce(last_seen_ts, logged_at, boot_ts) > ?
+                OR id = (
+                  SELECT id FROM boot_log
+                  WHERE boot_ts < ?
+                  ORDER BY boot_ts DESC, id DESC
+                  LIMIT 1
+                )
+              )
+            ORDER BY boot_ts ASC, id ASC
+            """,
+            (q_to, q_from, q_to),
         ).fetchall()
         if not rows:
             return 0.0
@@ -609,11 +694,20 @@ class Database:
             total += max(0.0, min(end, q_to) - max(start, q_from))
         return total
 
-    def totals_by_app(self, q_from: float, q_to: float) -> list[AppStat]:
+    def totals_by_app(
+        self,
+        q_from: float,
+        q_to: float,
+        *,
+        extra_intervals: Sequence[BufferedInterval] | None = None,
+    ) -> list[AppStat]:
         """Суммарное время по приложению: одна строка на exe (окно в фокусе)."""
         acc: dict[tuple[str, str], float] = {}
+        replacement_sql, replacement_params = self._replacement_filter(
+            "app", extra_intervals
+        )
         for row in self._conn.execute(
-            """
+            f"""
             SELECT exe_path, exe_name, start_ts, end_ts, duration_ms
             FROM intervals
             WHERE kind = 'app'
@@ -621,8 +715,9 @@ class Database:
               AND end_ts > ?
               AND end_ts > start_ts
               AND duration_ms > 0
+              {replacement_sql}
             """,
-            (q_to, q_from),
+            (q_to, q_from, *replacement_params),
         ):
             path = row["exe_path"] or ""
             name = row["exe_name"] or ""
@@ -631,6 +726,18 @@ class Database:
                 float(row["start_ts"]),
                 float(row["end_ts"]),
                 int(row["duration_ms"]),
+                q_from,
+                q_to,
+            )
+            acc[key] = acc.get(key, 0.0) + ms
+        for interval in self._extra_intervals(extra_intervals, "app", q_from, q_to):
+            path = interval.exe_path or ""
+            name = interval.exe_name or ""
+            key = (path, name)
+            ms = _overlap_ms(
+                interval.start_ts,
+                interval.end_ts,
+                interval.duration_ms,
                 q_from,
                 q_to,
             )
@@ -896,6 +1003,7 @@ class Database:
     # --- app categories ---
     def _invalidate_category_rules(self) -> None:
         self._category_rules_cache = None
+        self._normalized_category_rules_cache = None
 
     def _category_rules(self) -> list[sqlite3.Row]:
         if self._category_rules_cache is None:
@@ -915,6 +1023,26 @@ class Database:
 
     def list_category_rules(self) -> list[sqlite3.Row]:
         return list(self._category_rules())
+
+    def _normalized_category_rules(self) -> list[tuple[str, str, str]]:
+        if self._normalized_category_rules_cache is None:
+            rules: list[tuple[str, str, str]] = []
+            for row in self._category_rules():
+                match_kind = str(row["match_kind"] or "")
+                match_text = self._normalize_match_text(
+                    str(row["match_text"] or ""), match_kind
+                )
+                if not match_text:
+                    continue
+                rules.append(
+                    (
+                        match_kind,
+                        match_text,
+                        normalize_legacy_category(str(row["category"])),
+                    )
+                )
+            self._normalized_category_rules_cache = rules
+        return self._normalized_category_rules_cache
 
     def add_category_rule(
         self,
@@ -992,21 +1120,26 @@ class Database:
     def resolve_category(self, exe_path: str) -> str:
         path_lower = exe_path.lower().replace("\\", "/")
         base = path_lower.rsplit("/", 1)[-1]
-        for r in self._category_rules():
-            mt = self._normalize_match_text(
-                str(r["match_text"] or ""), str(r["match_kind"] or "")
-            )
-            if not mt:
-                continue
-            if r["match_kind"] == "exact_basename" and base == mt:
-                return normalize_legacy_category(str(r["category"]))
-            if r["match_kind"] == "path_contains" and mt in path_lower:
-                return normalize_legacy_category(str(r["category"]))
+        for match_kind, match_text, category in self._normalized_category_rules():
+            if match_kind == "exact_basename" and base == match_text:
+                return category
+            if match_kind == "path_contains" and match_text in path_lower:
+                return category
         return resolve_default_category(exe_path)
 
-    def totals_by_category(self, q_from: float, q_to: float) -> dict[str, float]:
+    def totals_by_category(
+        self,
+        q_from: float,
+        q_to: float,
+        *,
+        extra_intervals: Sequence[BufferedInterval] | None = None,
+    ) -> dict[str, float]:
         acc = {k: 0.0 for k in ALL_CATEGORY_KEYS}
-        for a in self.totals_by_app(q_from, q_to):
+        for a in self.totals_by_app(
+            q_from,
+            q_to,
+            extra_intervals=extra_intervals,
+        ):
             cat = a.category or self.resolve_category(a.exe_path)
             if cat not in acc:
                 acc[cat] = 0.0
@@ -1142,12 +1275,43 @@ class Database:
         slots = self._calendar_month_slots(q_from, q_to)
         return self._bucket_pc_active(slots, q_from, q_to)
 
+    @staticmethod
+    def _add_interval_to_slots(
+        totals: list[float],
+        slots: list[tuple[str, float, float]],
+        start: float,
+        end: float,
+        duration_ms: int,
+        q_from: float,
+        q_to: float,
+    ) -> None:
+        if start >= q_to or end <= q_from:
+            return
+        index = 0
+        while index < len(slots) and slots[index][2] <= start:
+            index += 1
+        while index < len(slots) and slots[index][1] < end:
+            _label, slot_start, slot_end = slots[index]
+            if slot_end > slot_start:
+                totals[index] += _overlap_ms(
+                    start, end, duration_ms, slot_start, slot_end
+                )
+            index += 1
+
     def _bucket_pc_active(
-        self, slots: list[tuple[str, float, float]], q_from: float, q_to: float
+        self,
+        slots: list[tuple[str, float, float]],
+        q_from: float,
+        q_to: float,
+        *,
+        extra_intervals: Sequence[BufferedInterval] | None = None,
     ) -> list[tuple[str, float]]:
         totals = [0.0 for _ in slots]
+        replacement_sql, replacement_params = self._replacement_filter(
+            "pc_active", extra_intervals
+        )
         rows = self._conn.execute(
-            """
+            f"""
             SELECT start_ts, end_ts, duration_ms
             FROM intervals
             WHERE kind = 'pc_active'
@@ -1155,9 +1319,10 @@ class Database:
               AND end_ts > ?
               AND end_ts > start_ts
               AND duration_ms > 0
+              {replacement_sql}
             ORDER BY start_ts
             """,
-            (q_to, q_from),
+            (q_to, q_from, *replacement_params),
         )
         slot_i = 0
         for row in rows:
@@ -1174,6 +1339,16 @@ class Database:
                         start, end, duration, slot_start, slot_end
                     )
                 i += 1
+        for interval in self._extra_intervals(extra_intervals, "pc_active", q_from, q_to):
+            self._add_interval_to_slots(
+                totals,
+                slots,
+                interval.start_ts,
+                interval.end_ts,
+                interval.duration_ms,
+                q_from,
+                q_to,
+            )
         return [(label, totals[i]) for i, (label, _a, _b) in enumerate(slots)]
 
     def chart_pc_active_series(
@@ -1188,10 +1363,15 @@ class Database:
         slots: list[tuple[str, float, float]],
         q_from: float,
         q_to: float,
+        *,
+        extra_intervals: Sequence[BufferedInterval] | None = None,
     ) -> dict[str, list[float]]:
         totals = {category: [0.0 for _ in slots] for category in ALL_CATEGORY_KEYS}
+        replacement_sql, replacement_params = self._replacement_filter(
+            "app", extra_intervals
+        )
         rows = self._conn.execute(
-            """
+            f"""
             SELECT start_ts, end_ts, duration_ms, exe_path, exe_name
             FROM intervals
             WHERE kind = 'app'
@@ -1199,9 +1379,10 @@ class Database:
               AND end_ts > ?
               AND end_ts > start_ts
               AND duration_ms > 0
+              {replacement_sql}
             ORDER BY start_ts
             """,
-            (q_to, q_from),
+            (q_to, q_from, *replacement_params),
         )
         category_cache: dict[str, str] = {}
         slot_i = 0
@@ -1225,6 +1406,25 @@ class Database:
                         start, end, duration, slot_start, slot_end
                     )
                 index += 1
+        for interval in self._extra_intervals(extra_intervals, "app", q_from, q_to):
+            start = interval.start_ts
+            end = interval.end_ts
+            duration = interval.duration_ms
+            path = str(interval.exe_path or interval.exe_name or "")
+            category = category_cache.get(path)
+            if category is None:
+                category = self.resolve_category(path)
+                category_cache[path] = category
+            values = totals.setdefault(category, [0.0 for _ in slots])
+            self._add_interval_to_slots(
+                values,
+                slots,
+                start,
+                end,
+                duration,
+                q_from,
+                q_to,
+            )
         return totals
 
     def period_stats(
@@ -1235,14 +1435,24 @@ class Database:
         *,
         include_chart: bool = True,
         chart_period: str | None = None,
+        extra_intervals: Sequence[BufferedInterval] | None = None,
     ) -> PeriodStats:
-        pc_ms = self.total_pc_ms(q_from, q_to)
+        live_intervals = tuple(extra_intervals or ())
+        pc_ms = self.total_pc_ms(
+            q_from,
+            q_to,
+            extra_intervals=live_intervals,
+        )
         previous_pc_ms: float | None = None
         if previous_range is not None:
             previous_from, previous_to = previous_range
             if previous_to > previous_from:
                 previous_pc_ms = self.total_pc_ms(previous_from, previous_to)
-        apps = self.totals_by_app(q_from, q_to)
+        apps = self.totals_by_app(
+            q_from,
+            q_to,
+            extra_intervals=live_intervals,
+        )
         by_category = {k: 0.0 for k in ALL_CATEGORY_KEYS}
         for app in apps:
             cat = app.category or self.resolve_category(app.exe_path)
@@ -1254,8 +1464,18 @@ class Database:
             chart_mode, chart_slots = self._chart_slots(
                 q_from, q_to, chart_period
             )
-            chart_series = self._bucket_pc_active(chart_slots, q_from, q_to)
-            chart_by_category = self._bucket_app_categories(chart_slots, q_from, q_to)
+            chart_series = self._bucket_pc_active(
+                chart_slots,
+                q_from,
+                q_to,
+                extra_intervals=live_intervals,
+            )
+            chart_by_category = self._bucket_app_categories(
+                chart_slots,
+                q_from,
+                q_to,
+                extra_intervals=live_intervals,
+            )
         return PeriodStats(
             q_from=q_from,
             q_to=q_to,

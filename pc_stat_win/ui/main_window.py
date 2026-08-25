@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import sqlite3
 import time
 from functools import partial
 from pathlib import Path
 
 import psutil
-from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QByteArray,
+    QEasingCurve,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QCloseEvent,
     QDesktopServices,
@@ -29,6 +40,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -70,6 +82,8 @@ from pc_stat_win.ui.reports_tab import ReportsTab
 
 
 LOGGER = logging.getLogger(__name__)
+_PAGE_FADE_MS = 135
+_THEME_FADE_MS = 165
 
 
 class MainWindow(QMainWindow):
@@ -89,6 +103,7 @@ class MainWindow(QMainWindow):
         *,
         window_icon: QIcon | None = None,
         tray_available: bool = True,
+        boot_time: float | None = None,
     ) -> None:
         super().__init__()
         self._db = db
@@ -105,6 +120,15 @@ class MainWindow(QMainWindow):
         self._period_offset = 0
         self._maintenance_busy = False
         self._busy_cursor_active = False
+        self._boot_time = float(psutil.boot_time() if boot_time is None else boot_time)
+        self._transitions_ready = False
+        self._visual_transitions_enabled = os.environ.get("PCSTAT_DISABLE_ANIMATIONS") != "1"
+        self._page_fade_animation: QPropertyAnimation | None = None
+        self._page_fade_effect: QGraphicsOpacityEffect | None = None
+        self._page_fade_widget: QWidget | None = None
+        self._theme_fade_animation: QPropertyAnimation | None = None
+        self._theme_fade_effect: QGraphicsOpacityEffect | None = None
+        self._theme_fade_widget: QWidget | None = None
 
         self.setWindowTitle("PC Stat — активность")
         if window_icon is not None and not window_icon.isNull():
@@ -118,6 +142,7 @@ class MainWindow(QMainWindow):
             saved_period if saved_period in ("today", "week", "month", "year", "all") else "week"
         )
         self._build()
+        self._transitions_ready = True
         self._restore_window_state()
 
         self._collector.tick_done.connect(self._mark_refresh_dirty)
@@ -197,6 +222,7 @@ class MainWindow(QMainWindow):
         content.setSpacing(12)
         header = QFrame()
         header.setObjectName("glassSurface")
+        header.setProperty("elevated", True)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(14, 10, 14, 10)
         self._page_title = QLabel("Статистика")
@@ -303,16 +329,17 @@ class MainWindow(QMainWindow):
         self._kpi_grid.setContentsMargins(12, 12, 12, 12)
         self._kpi_grid.setSpacing(8)
         self._kpi_labels: dict[str, QLabel] = {}
-        for key, title in (
-            ("active", "Активное время"),
-            ("uptime", "Работа ПК"),
-            ("share", "Доля активности"),
-            ("coverage", "Покрытие"),
-            ("apps", "Приложений"),
-            ("session", "Текущая сессия"),
+        for key, title, tone in (
+            ("active", "Активное время", "blue"),
+            ("uptime", "Работа ПК", "teal"),
+            ("share", "Доля активности", "violet"),
+            ("coverage", "Покрытие", "amber"),
+            ("apps", "Приложений", "rose"),
+            ("session", "Текущая сессия", "slate"),
         ):
             item = QFrame()
             item.setObjectName("metricBlock")
+            item.setProperty("metricTone", tone)
             item_layout = QVBoxLayout(item)
             item_layout.setContentsMargins(10, 7, 10, 7)
             name = QLabel(title)
@@ -343,6 +370,7 @@ class MainWindow(QMainWindow):
             duration.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             duration.setMinimumWidth(90)
             bar = QProgressBar()
+            bar.setProperty("compact", True)
             bar.setRange(0, 1000)
             bar.setTextVisible(False)
             bar.setFixedHeight(8)
@@ -624,6 +652,10 @@ class MainWindow(QMainWindow):
         return button
 
     def _set_page(self, index: int) -> None:
+        if index < 0 or index >= self._stack.count():
+            return
+        if index == self._stack.currentIndex():
+            return
         self._stack.setCurrentIndex(index)
 
     def _on_page_changed(self, index: int) -> None:
@@ -656,6 +688,7 @@ class MainWindow(QMainWindow):
             self._reports.set_period_context(self._current_period, 0)
             if index == self.PAGE_STATS:
                 self.refresh_stats()
+        self._fade_current_page()
 
     def _set_period(self, period: Period) -> None:
         self._current_period = period
@@ -698,7 +731,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def refresh_stats(self, *, force_reports: bool = False) -> None:
         try:
-            self._collector.flush("stats")
+            live_intervals = self._collector.live_intervals_snapshot()
             q_from, q_to = self._period_bounds()
             previous = previous_period_range(self._current_period, q_from, q_to)
             reports_visible = force_reports or self._stack.currentIndex() == self.PAGE_REPORTS
@@ -708,6 +741,7 @@ class MainWindow(QMainWindow):
                 previous_range=previous,
                 include_chart=reports_visible,
                 chart_period=self._current_period if reports_visible else None,
+                extra_intervals=live_intervals,
             )
         except Exception as exc:
             LOGGER.warning("Unable to refresh statistics", exc_info=True)
@@ -728,7 +762,7 @@ class MainWindow(QMainWindow):
             if denominator > 0
             else 0.0
         )
-        session = max(0.0, time.time() - float(psutil.boot_time()))
+        session = max(0.0, time.time() - self._boot_time)
         self._kpi_labels["active"].setText(format_duration_ms(stats.pc_ms))
         self._kpi_labels["uptime"].setText(format_duration_seconds(uptime_seconds))
         self._kpi_labels["share"].setText(f"{share:.1f}%")
@@ -758,9 +792,18 @@ class MainWindow(QMainWindow):
         self._restore_app_table_state(selected_path, vertical_scroll, horizontal_scroll)
 
     def _set_collector_status(self, healthy: bool, details: str = "") -> None:
-        self._collector_status.setText("●  Сбор активен" if healthy else "●  Ошибка обновления")
-        self._collector_status.setObjectName("statusOk" if healthy else "statusError")
-        self._collector_status.setToolTip("" if healthy else details)
+        text = "●  Сбор активен" if healthy else "●  Ошибка обновления"
+        object_name = "statusOk" if healthy else "statusError"
+        tooltip = "" if healthy else details
+        if (
+            self._collector_status.text() == text
+            and self._collector_status.objectName() == object_name
+            and self._collector_status.toolTip() == tooltip
+        ):
+            return
+        self._collector_status.setText(text)
+        self._collector_status.setObjectName(object_name)
+        self._collector_status.setToolTip(tooltip)
         style = self._collector_status.style()
         style.unpolish(self._collector_status)
         style.polish(self._collector_status)
@@ -1115,6 +1158,7 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self, resolved_theme: str) -> None:
         self._reports.apply_chart_theme(resolved_theme)
+        self._fade_theme_change()
 
     def _export_csv(self) -> None:
         path, _selected = QFileDialog.getSaveFileName(
@@ -1230,6 +1274,98 @@ class MainWindow(QMainWindow):
         if self._refresh_dirty:
             QTimer.singleShot(0, self.refresh_stats)
 
+    def _fade_current_page(self) -> None:
+        self._start_opacity_transition(
+            self._stack.currentWidget(),
+            animation_attr="_page_fade_animation",
+            effect_attr="_page_fade_effect",
+            widget_attr="_page_fade_widget",
+            start_opacity=0.84,
+            duration_ms=_PAGE_FADE_MS,
+        )
+
+    def _fade_theme_change(self) -> None:
+        self._start_opacity_transition(
+            self.centralWidget(),
+            animation_attr="_theme_fade_animation",
+            effect_attr="_theme_fade_effect",
+            widget_attr="_theme_fade_widget",
+            start_opacity=0.90,
+            duration_ms=_THEME_FADE_MS,
+        )
+
+    def _start_opacity_transition(
+        self,
+        widget: QWidget | None,
+        *,
+        animation_attr: str,
+        effect_attr: str,
+        widget_attr: str,
+        start_opacity: float,
+        duration_ms: int,
+    ) -> None:
+        if (
+            widget is None
+            or not self._transitions_ready
+            or not self._visual_transitions_enabled
+            or not self.isVisible()
+        ):
+            return
+        self._stop_opacity_transition(animation_attr, effect_attr, widget_attr)
+        effect = QGraphicsOpacityEffect(widget)
+        effect.setOpacity(start_opacity)
+        widget.setGraphicsEffect(effect)
+        animation = QPropertyAnimation(effect, b"opacity", widget)
+        animation.setDuration(duration_ms)
+        animation.setStartValue(start_opacity)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def cleanup() -> None:
+            if widget.graphicsEffect() is effect:
+                widget.setGraphicsEffect(None)
+            if getattr(self, animation_attr, None) is animation:
+                setattr(self, animation_attr, None)
+            if getattr(self, effect_attr, None) is effect:
+                setattr(self, effect_attr, None)
+            if getattr(self, widget_attr, None) is widget:
+                setattr(self, widget_attr, None)
+
+        animation.finished.connect(cleanup)
+        setattr(self, animation_attr, animation)
+        setattr(self, effect_attr, effect)
+        setattr(self, widget_attr, widget)
+        animation.start()
+
+    def _stop_opacity_transition(
+        self,
+        animation_attr: str,
+        effect_attr: str,
+        widget_attr: str,
+    ) -> None:
+        animation = getattr(self, animation_attr, None)
+        if animation is not None:
+            animation.stop()
+        widget = getattr(self, widget_attr, None)
+        effect = getattr(self, effect_attr, None)
+        if isinstance(widget, QWidget) and widget.graphicsEffect() is effect:
+            widget.setGraphicsEffect(None)
+        setattr(self, animation_attr, None)
+        setattr(self, effect_attr, None)
+        setattr(self, widget_attr, None)
+
+    def _finish_visual_transitions(self) -> None:
+        self._stop_opacity_transition(
+            "_page_fade_animation",
+            "_page_fade_effect",
+            "_page_fade_widget",
+        )
+        self._stop_opacity_transition(
+            "_theme_fade_animation",
+            "_theme_fade_effect",
+            "_theme_fade_widget",
+        )
+
     def _setting_value(self, key: str, default: str) -> str:
         try:
             return self._db.get_setting(key, default) or default
@@ -1305,6 +1441,7 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._finish_visual_transitions()
         self._save_window_state()
         close_to_tray = self._setting_value("close_to_tray", "1") == "1"
         if self._tray_available and close_to_tray:

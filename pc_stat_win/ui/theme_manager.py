@@ -60,13 +60,26 @@ class ThemeManager(QObject):
 
     def apply(self) -> None:
         resolved = resolve_theme(self._mode, self._style_hints)
-        self._app.setProperty("themeMode", self._mode)
-        self._app.setProperty("resolvedTheme", resolved)
-        self._app.setPalette(semantic_qpalette(resolved, self._style_hints))
-        self._app.setStyleSheet(render_stylesheet(resolved))
+        windows_list: list[QWidget] = []
+        for window in (*tuple(self._windows), *self._app.topLevelWidgets()):
+            if not any(window is existing for existing in windows_list):
+                windows_list.append(window)
+        windows = tuple(windows_list)
+        disabled_updates = [window for window in windows if window.updatesEnabled()]
+        for window in disabled_updates:
+            window.setUpdatesEnabled(False)
+        try:
+            self._app.setProperty("themeMode", self._mode)
+            self._app.setProperty("resolvedTheme", resolved)
+            self._app.setPalette(semantic_qpalette(resolved, self._style_hints))
+            self._app.setStyleSheet(render_stylesheet(resolved))
 
-        for window in tuple(self._windows):
-            apply_window_material(window, dark=resolved == "dark")
+            for window in windows:
+                apply_window_material(window, dark=resolved == "dark")
+        finally:
+            for window in disabled_updates:
+                window.setUpdatesEnabled(True)
+                window.update()
 
         changed = resolved != self._resolved
         self._resolved = resolved

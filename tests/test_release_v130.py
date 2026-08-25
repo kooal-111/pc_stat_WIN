@@ -61,10 +61,10 @@ class ReleaseV130Tests(unittest.TestCase):
         for requirement in ("pyside6==6.11.0", "pyinstaller==6.19.0", "pip-audit==2.10.1"):
             self.assertIn(requirement, lock)
 
-    def test_application_version_is_132(self) -> None:
+    def test_application_version_is_133(self) -> None:
         self.assertRegex(
             read("pc_stat_win/version.py"),
-            r'(?m)^APP_VERSION\s*=\s*"1\.3\.2"$',
+            r'(?m)^APP_VERSION\s*=\s*"1\.3\.3"$',
         )
 
     def test_build_is_clean_scoped_and_does_not_regenerate_icons(self) -> None:
@@ -149,7 +149,7 @@ class ReleaseV130Tests(unittest.TestCase):
 
     def test_readme_matches_release_version_and_single_command_flow(self) -> None:
         readme = read("README.md")
-        self.assertTrue(readme.startswith("# PC Stat 1.3.2"))
+        self.assertTrue(readme.startswith("# PC Stat 1.3.3"))
         release_section = readme.split("## Версия и выпуск", 1)[1].split("## Настройки", 1)[0]
         self.assertIn(".\\scripts\\publish_release.ps1", release_section)
         self.assertIn("schema 7", release_section)

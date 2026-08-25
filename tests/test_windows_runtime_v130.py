@@ -63,6 +63,26 @@ class ForegroundV130Tests(unittest.TestCase):
         self.assertEqual(info.exe_name, "editor.exe")
         self.assertEqual(info.window_title, "")
 
+    def test_title_query_can_be_skipped_for_default_privacy_mode(self) -> None:
+        with patch("pc_stat_win.foreground.win32gui.GetForegroundWindow", return_value=77), patch(
+            "pc_stat_win.foreground.win32process.GetWindowThreadProcessId",
+            return_value=(1, 42),
+        ), patch(
+            "pc_stat_win.foreground.win32gui.GetWindowText"
+        ) as get_title, patch(
+            "pc_stat_win.foreground._process_identity",
+            return_value=(r"C:\Apps\editor.exe", "editor.exe"),
+        ):
+            info = foreground.get_foreground_app(
+                monotonic_clock=lambda: 1.0,
+                include_window_title=False,
+            )
+
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertEqual(info.window_title, "")
+        get_title.assert_not_called()
+
     def test_cache_key_includes_window_handle_to_reduce_pid_reuse_risk(self) -> None:
         process = SimpleNamespace(exe=lambda: r"C:\Apps\editor.exe")
         with patch("pc_stat_win.foreground.psutil.Process", return_value=process) as factory:

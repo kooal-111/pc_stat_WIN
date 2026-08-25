@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from inspect import Parameter, signature
 
 import psutil
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -35,7 +36,7 @@ class UsageCollector(QObject):
         *,
         wall_clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
-        foreground_provider: Callable[[], ForegroundInfo | None] = get_foreground_app,
+        foreground_provider: Callable[..., ForegroundInfo | None] = get_foreground_app,
         idle_provider: Callable[[], float | None] = idle_seconds,
         boot_time_provider: Callable[[], float] = psutil.boot_time,
         stop_retry_attempts: int = 3,
@@ -46,6 +47,9 @@ class UsageCollector(QObject):
         self._wall_clock = wall_clock
         self._monotonic_clock = monotonic_clock
         self._foreground_provider = foreground_provider
+        self._foreground_accepts_title_flag = (
+            self._provider_accepts_include_window_title(foreground_provider)
+        )
         self._idle_provider = idle_provider
         self._stop_retry_attempts = max(1, int(stop_retry_attempts))
         self._retry_sleep = retry_sleep
@@ -99,6 +103,15 @@ class UsageCollector(QObject):
         self._last_wall = self._wall_clock()
         self._last_flush_monotonic = now_mono
         self._timer.start()
+
+    def live_intervals_snapshot(self) -> tuple[BufferedInterval, ...]:
+        """Return unflushed intervals so UI stats can stay live without a DB write."""
+        intervals = list(self._pending_intervals)
+        if self._pc_interval is not None:
+            intervals.append(self._pc_interval)
+        if self._app_interval is not None:
+            intervals.append(self._app_interval)
+        return tuple(intervals)
 
     def stop(self) -> bool:
         self._timer.stop()
@@ -203,7 +216,7 @@ class UsageCollector(QObject):
         if duration_ms <= 0:
             return
 
-        foreground = self._foreground_provider()
+        foreground = self._current_foreground()
         tracked = (
             foreground
             if foreground is not None
@@ -311,6 +324,27 @@ class UsageCollector(QObject):
             )
         self._pending_intervals.clear()
         self._last_flush_monotonic = now_mono
+
+    @staticmethod
+    def _provider_accepts_include_window_title(
+        provider: Callable[..., ForegroundInfo | None],
+    ) -> bool:
+        try:
+            parameters = signature(provider).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.kind == Parameter.VAR_KEYWORD
+            or parameter.name == "include_window_title"
+            for parameter in parameters
+        )
+
+    def _current_foreground(self) -> ForegroundInfo | None:
+        if self._foreground_accepts_title_flag:
+            return self._foreground_provider(
+                include_window_title=self._collect_window_titles
+            )
+        return self._foreground_provider()
 
     def _complete_open_intervals(self) -> None:
         if self._pc_interval is not None:

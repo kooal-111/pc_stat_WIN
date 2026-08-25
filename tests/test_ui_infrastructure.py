@@ -78,15 +78,18 @@ class UiInfrastructureTests(unittest.TestCase):
         light = render_stylesheet("light")
         dark = render_stylesheet("dark")
 
-        for rendered in (light, dark):
+        for theme, rendered in (("light", light), ("dark", dark)):
             self.assertNotIn("${", rendered)
             self.assertIn("background-color: transparent", rendered)
-            self.assertIn(f"border: 2px solid {ACCENT}", rendered)
+            self.assertIn(
+                f"border: 2px solid {semantic_palette(theme)['accent']}",
+                rendered,
+            )
             self.assertIn("min-height: 36px", rendered)
             self.assertIn("rgba(", rendered)
 
         self.assertEqual(semantic_palette("light")["accent"], ACCENT)
-        self.assertEqual(semantic_palette("dark")["accent"], ACCENT)
+        self.assertEqual(semantic_palette("dark")["accent"], "#22D3EE")
         self.assertNotEqual(light, dark)
         self.assertIn("QMainWindow[windowMaterial=\"mica\"]", light)
         self.assertIn(semantic_palette("light")["window_tint"], light)

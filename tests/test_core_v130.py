@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+import logging
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,44 @@ from pc_stat_win.categories import BROWSER, WORK
 from pc_stat_win.collector import UsageCollector
 from pc_stat_win.db import BufferedInterval, Database, SCHEMA_VERSION
 from pc_stat_win.foreground import ForegroundInfo
+
+
+class LoggingV130Tests(unittest.TestCase):
+    def test_configure_logging_falls_back_when_primary_file_unavailable(self) -> None:
+        from pc_stat_win import logging_config
+
+        root_logger = logging.getLogger()
+        original_handlers = list(root_logger.handlers)
+        with tempfile.TemporaryDirectory() as tmp:
+            primary = Path(tmp) / "blocked" / "pc_stat.log"
+            temp_root = Path(tmp) / "temp"
+            expected = (
+                temp_root / "pc_stat_win" / "logs" / logging_config.LOG_FILENAME
+            ).resolve()
+            original_file_handler = logging_config._file_handler
+
+            def guarded_file_handler(path: Path, level: int):
+                if path == primary.resolve():
+                    raise PermissionError("blocked")
+                return original_file_handler(path, level)
+
+            try:
+                with patch(
+                    "pc_stat_win.logging_config.tempfile.gettempdir",
+                    return_value=str(temp_root),
+                ), patch(
+                    "pc_stat_win.logging_config._file_handler",
+                    side_effect=guarded_file_handler,
+                ):
+                    result = logging_config.configure_logging(primary)
+
+                self.assertEqual(result, expected)
+                self.assertTrue(expected.exists())
+            finally:
+                for handler in list(root_logger.handlers):
+                    if handler not in original_handlers:
+                        root_logger.removeHandler(handler)
+                        handler.close()
 
 
 class FakeClock:
@@ -128,6 +167,42 @@ class DatabaseV130Tests(unittest.TestCase):
                 db._conn.execute("PRAGMA journal_size_limit").fetchone()[0],
                 8 * 1024 * 1024,
             )
+            indexes = {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+            self.assertIn("idx_intervals_kind_end_start", indexes)
+            db.close()
+            conn = sqlite3.connect(path)
+            try:
+                persisted_indexes = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index'"
+                    )
+                }
+            finally:
+                conn.close()
+            self.assertIn("idx_intervals_kind_end_start", persisted_indexes)
+
+    def test_existing_v7_database_gets_overlap_index_on_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data.sqlite"
+            db = Database(path)
+            db._conn.execute("DROP INDEX idx_intervals_kind_end_start")
+            db._conn.commit()
+            db.close()
+
+            db = Database(path)
+            indexes = {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+            self.assertIn("idx_intervals_kind_end_start", indexes)
             db.close()
 
     def test_v6_to_v7_migration_rolls_back_schema_and_dedup_on_failure(self) -> None:
@@ -247,6 +322,40 @@ class DatabaseV130Tests(unittest.TestCase):
             )
             db.close()
 
+    def test_private_compaction_runs_only_when_titles_were_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "data.sqlite")
+            with patch.object(db, "_compact_private_data") as compact:
+                db.set_collect_window_titles(False)
+            compact.assert_not_called()
+
+            db.set_collect_window_titles(True)
+            db.persist_usage(
+                [
+                    BufferedInterval(
+                        "app",
+                        1.0,
+                        2.0,
+                        1_000,
+                        "C:/Apps/private.exe",
+                        "private.exe",
+                        "Secret",
+                    )
+                ]
+            )
+            with patch.object(db, "_compact_private_data") as compact:
+                db.set_collect_window_titles(False)
+            compact.assert_called_once_with()
+            db.close()
+
+    def test_delete_empty_history_skips_compaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "data.sqlite")
+            with patch.object(db, "_compact_private_data") as compact:
+                self.assertEqual(db.delete_all_history(), 0)
+            compact.assert_not_called()
+            db.close()
+
     def test_uptime_excludes_off_time_between_historical_boots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "data.sqlite")
@@ -260,6 +369,25 @@ class DatabaseV130Tests(unittest.TestCase):
             db._conn.commit()
             with patch("pc_stat_win.db.time.time", return_value=340.0):
                 self.assertEqual(db.estimated_pc_uptime_seconds(0.0, 400.0), 90.0)
+            db.close()
+
+    def test_uptime_query_ignores_boots_outside_requested_period(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "data.sqlite")
+            db._conn.executemany(
+                """
+                INSERT INTO boot_log (boot_ts, logged_at, last_seen_ts)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    (100.0, 110.0, 150.0),
+                    (300.0, 305.0, 330.0),
+                ),
+            )
+            db._conn.commit()
+            with patch("pc_stat_win.db.time.time", return_value=340.0):
+                self.assertEqual(db.estimated_pc_uptime_seconds(200.0, 400.0), 40.0)
+            self.assertEqual(db.estimated_pc_uptime_seconds(400.0, 200.0), 0.0)
             db.close()
 
     def test_persist_usage_returns_ordered_ids_and_updates_title(self) -> None:
@@ -290,6 +418,56 @@ class DatabaseV130Tests(unittest.TestCase):
                 (ids[0],),
             ).fetchone()
             self.assertEqual((row["duration_ms"], row["window_title"]), (3_000, "New"))
+            db.close()
+
+    def test_period_stats_can_overlay_live_intervals_without_double_counting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "data.sqlite")
+            saved_ids = db.persist_usage(
+                [
+                    BufferedInterval("pc_active", 10.0, 20.0, 10_000),
+                    BufferedInterval("app", 10.0, 20.0, 10_000, "C:/Apps/a.exe", "a.exe"),
+                ]
+            )
+            live = [
+                BufferedInterval(
+                    "pc_active",
+                    10.0,
+                    30.0,
+                    20_000,
+                    row_id=saved_ids[0],
+                ),
+                BufferedInterval(
+                    "app",
+                    10.0,
+                    30.0,
+                    20_000,
+                    "C:/Apps/a.exe",
+                    "a.exe",
+                    row_id=saved_ids[1],
+                ),
+                BufferedInterval("app", 30.0, 35.0, 5_000, "C:/Apps/b.exe", "b.exe"),
+            ]
+
+            stats = db.period_stats(
+                0.0,
+                40.0,
+                include_chart=True,
+                chart_period="today",
+                extra_intervals=live,
+            )
+
+            self.assertEqual(stats.pc_ms, 20_000.0)
+            self.assertEqual(sum(app.active_ms for app in stats.apps), 25_000.0)
+            self.assertEqual(
+                {app.exe_name: app.active_ms for app in stats.apps},
+                {"a.exe": 20_000.0, "b.exe": 5_000.0},
+            )
+            self.assertEqual(sum(value for _label, value in stats.chart_series), 20_000.0)
+            self.assertEqual(
+                sum(sum(values) for values in stats.chart_by_category.values()),
+                25_000.0,
+            )
             db.close()
 
     def test_persist_usage_rolls_back_whole_sequence(self) -> None:

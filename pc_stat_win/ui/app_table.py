@@ -28,6 +28,15 @@ SORT_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 CATEGORY_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 PATH_ROLE = int(Qt.ItemDataRole.UserRole) + 3
 SEARCH_ROLE = int(Qt.ItemDataRole.UserRole) + 4
+UPDATE_ROLES = [
+    int(Qt.ItemDataRole.DisplayRole),
+    int(Qt.ItemDataRole.DecorationRole),
+    int(Qt.ItemDataRole.ToolTipRole),
+    int(SORT_ROLE),
+    int(CATEGORY_ROLE),
+    int(PATH_ROLE),
+    int(SEARCH_ROLE),
+]
 
 
 class AppTableColumn(IntEnum):
@@ -132,11 +141,23 @@ class AppTableModel(QAbstractTableModel):
         return None
 
     def set_rows(self, rows: Sequence[object], *, total_ms: float | None = None) -> None:
+        new_rows = list(rows)
+        new_display_cache = [self._cache_row(row) for row in new_rows]
+        new_total_ms = self._total_ms if total_ms is None else max(0.0, float(total_ms))
+        if self._can_update_in_place(new_rows):
+            self._rows = new_rows
+            self._display_cache = new_display_cache
+            self._total_ms = new_total_ms
+            if self._rows:
+                top = self.index(0, 0)
+                bottom = self.index(len(self._rows) - 1, len(_HEADERS) - 1)
+                self.dataChanged.emit(top, bottom, UPDATE_ROLES)
+            return
+
         self.beginResetModel()
-        self._rows = list(rows)
-        self._display_cache = [self._cache_row(row) for row in self._rows]
-        if total_ms is not None:
-            self._total_ms = max(0.0, float(total_ms))
+        self._rows = new_rows
+        self._display_cache = new_display_cache
+        self._total_ms = new_total_ms
         self.endResetModel()
 
     def set_total_ms(self, total_ms: float) -> None:
@@ -155,6 +176,21 @@ class AppTableModel(QAbstractTableModel):
 
     def row_at(self, row: int) -> object | None:
         return self._rows[row] if 0 <= row < len(self._rows) else None
+
+    def _can_update_in_place(self, new_rows: Sequence[object]) -> bool:
+        if len(new_rows) != len(self._rows):
+            return False
+        return all(
+            self._identity(old) == self._identity(new)
+            for old, new in zip(self._rows, new_rows)
+        )
+
+    @staticmethod
+    def _identity(row: object) -> tuple[str, str]:
+        return (
+            str(_field(row, "exe_path", "") or ""),
+            str(_field(row, "exe_name", "") or ""),
+        )
 
     @classmethod
     def _cache_row(cls, row: object) -> tuple[str, str, str, str]:
