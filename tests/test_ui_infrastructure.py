@@ -81,7 +81,7 @@ class UiInfrastructureTests(unittest.TestCase):
         for rendered in (light, dark):
             self.assertNotIn("${", rendered)
             self.assertIn("background-color: transparent", rendered)
-            self.assertIn("border: 2px solid #2563EB", rendered)
+            self.assertIn(f"border: 2px solid {ACCENT}", rendered)
             self.assertIn("min-height: 36px", rendered)
             self.assertIn("rgba(", rendered)
 
@@ -89,7 +89,7 @@ class UiInfrastructureTests(unittest.TestCase):
         self.assertEqual(semantic_palette("dark")["accent"], ACCENT)
         self.assertNotEqual(light, dark)
         self.assertIn("QMainWindow[windowMaterial=\"mica\"]", light)
-        self.assertIn("rgba(238, 244, 250, 248)", light)
+        self.assertIn(semantic_palette("light")["window_tint"], light)
         self.assertNotIn(
             'QMainWindow[windowMaterial="mica"] {\n    background-color: transparent;',
             light,

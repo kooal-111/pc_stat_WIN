@@ -24,6 +24,13 @@ _JOURNAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024
 RETENTION_DAY_OPTIONS = (0, 30, 90, 180, 365)
 
 
+def normalize_rule_match_text(match_text: str, match_kind: str) -> str:
+    raw = match_text.strip().lower()
+    if match_kind == "exact_basename":
+        return os.path.basename(raw.replace("/", "\\"))
+    return raw.replace("\\", "/")
+
+
 def _overlap_ms(start_ts: float, end_ts: float, duration_ms: int, q_from: float, q_to: float) -> float:
     span = end_ts - start_ts
     if span <= 0 or duration_ms <= 0:
@@ -904,10 +911,7 @@ class Database:
         return self._category_rules_cache
 
     def _normalize_match_text(self, match_text: str, match_kind: str) -> str:
-        raw = match_text.strip().lower()
-        if match_kind == "exact_basename":
-            return os.path.basename(raw.replace("/", "\\"))
-        return raw.replace("\\", "/")
+        return normalize_rule_match_text(match_text, match_kind)
 
     def list_category_rules(self) -> list[sqlite3.Row]:
         return list(self._category_rules())

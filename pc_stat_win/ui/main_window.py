@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import sqlite3
 import time
 from functools import partial
 from pathlib import Path
@@ -53,7 +54,13 @@ from pc_stat_win import autostart
 from pc_stat_win.categories import CATEGORY_LABELS_RU, OTHER
 from pc_stat_win.collector import UsageCollector
 from pc_stat_win.config import UI_REFRESH_INTERVAL_MS
-from pc_stat_win.db import AppStat, Database, PeriodStats, RETENTION_DAY_OPTIONS
+from pc_stat_win.db import (
+    AppStat,
+    Database,
+    PeriodStats,
+    RETENTION_DAY_OPTIONS,
+    normalize_rule_match_text,
+)
 from pc_stat_win.exe_metadata import friendly_app_name
 from pc_stat_win.export import export_apps_csv
 from pc_stat_win.formatting import format_duration_ms, format_duration_seconds
@@ -96,6 +103,8 @@ class MainWindow(QMainWindow):
         self._categories_compact = False
         self._collector_error_detail: str | None = None
         self._period_offset = 0
+        self._maintenance_busy = False
+        self._busy_cursor_active = False
 
         self.setWindowTitle("PC Stat — активность")
         if window_icon is not None and not window_icon.isNull():
@@ -104,7 +113,7 @@ class MainWindow(QMainWindow):
         self.resize(1180, 760)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, tray_available)
 
-        saved_period = self._db.get_setting("ui_period", "week") or "week"
+        saved_period = self._setting_value("ui_period", "week")
         self._current_period: Period = (
             saved_period if saved_period in ("today", "week", "month", "year", "all") else "week"
         )
@@ -249,7 +258,10 @@ class MainWindow(QMainWindow):
         content.addWidget(self._stack, 1)
         root.addLayout(content, 1)
 
-        saved_page = int(self._db.get_setting("ui_page", "0") or "0")
+        try:
+            saved_page = int(self._setting_value("ui_page", "0"))
+        except ValueError:
+            saved_page = 0
         saved_page = max(0, min(self._stack.count() - 1, saved_page))
         self._stack.setCurrentIndex(saved_page)
         self._nav_buttons[saved_page].setChecked(True)
@@ -508,9 +520,7 @@ class MainWindow(QMainWindow):
             (self._db.get_setting("close_to_tray", "1") or "1") == "1"
         )
         self._close_to_tray_cb.setEnabled(self._tray_available)
-        self._close_to_tray_cb.toggled.connect(
-            lambda checked: self._db.set_setting("close_to_tray", "1" if checked else "0")
-        )
+        self._close_to_tray_cb.toggled.connect(self._save_close_to_tray)
         behavior_form.addRow(self._close_to_tray_cb)
         self._collect_window_titles_cb = QCheckBox("Сохранять заголовки окон")
         self._collect_window_titles_cb.setAccessibleName("Сохранять заголовки окон")
@@ -625,7 +635,7 @@ class MainWindow(QMainWindow):
         self._btn_export.setVisible(index in (self.PAGE_STATS, self.PAGE_REPORTS))
         self._reports.set_active(index == self.PAGE_REPORTS)
         self._sync_period_labels()
-        self._db.set_setting("ui_page", str(index))
+        self._set_setting_best_effort("ui_page", str(index), "UI page")
         if index == self.PAGE_REPORTS:
             self._reports.set_period_context(self._current_period, self._period_offset)
             if self._refresh_dirty:
@@ -650,7 +660,7 @@ class MainWindow(QMainWindow):
     def _set_period(self, period: Period) -> None:
         self._current_period = period
         self._period_offset = 0
-        self._db.set_setting("ui_period", period)
+        self._set_setting_best_effort("ui_period", period, "UI period")
         self._sync_period_buttons()
         self._reports.set_period_context(period, 0)
         self.refresh_stats(force_reports=self._stack.currentIndex() == self.PAGE_REPORTS)
@@ -904,16 +914,48 @@ class MainWindow(QMainWindow):
             return None
         return text, kind, category
 
+    def _rule_duplicate_exists(
+        self,
+        text: str,
+        kind: str,
+        *,
+        exclude_rule_id: int | None = None,
+    ) -> bool:
+        normalized = normalize_rule_match_text(text, kind)
+        for rule in self._db.list_category_rules():
+            if exclude_rule_id is not None and int(rule["id"]) == exclude_rule_id:
+                continue
+            if rule["match_kind"] != kind:
+                continue
+            existing = normalize_rule_match_text(str(rule["match_text"]), kind)
+            if existing == normalized:
+                return True
+        return False
+
+    def _show_duplicate_rule_message(self) -> None:
+        QMessageBox.information(
+            self,
+            "Правило",
+            "Правило с таким шаблоном уже существует.",
+        )
+
     def _add_category_rule(self) -> None:
         values = self._rule_values()
         if values is None:
             return
         text, kind, category = values
-        for rule in self._db.list_category_rules():
-            if rule["match_kind"] == kind and str(rule["match_text"]).casefold() == text.casefold():
-                QMessageBox.information(self, "Правило", "Такое правило уже существует.")
+        try:
+            if self._rule_duplicate_exists(text, kind):
+                self._show_duplicate_rule_message()
                 return
-        self._selected_rule = self._db.add_category_rule(text, kind, category)
+            self._selected_rule = self._db.add_category_rule(text, kind, category)
+        except sqlite3.IntegrityError:
+            self._show_duplicate_rule_message()
+            return
+        except Exception as exc:
+            LOGGER.warning("Unable to add category rule", exc_info=True)
+            QMessageBox.warning(self, "Правило", f"Не удалось добавить правило.\n\n{exc}")
+            return
         self._refresh_rules_table()
         self.refresh_stats()
 
@@ -923,7 +965,18 @@ class MainWindow(QMainWindow):
         if rule_id is None or values is None:
             return
         text, kind, category = values
-        self._db.update_category_rule(rule_id, text, kind, category)
+        try:
+            if self._rule_duplicate_exists(text, kind, exclude_rule_id=rule_id):
+                self._show_duplicate_rule_message()
+                return
+            self._db.update_category_rule(rule_id, text, kind, category)
+        except sqlite3.IntegrityError:
+            self._show_duplicate_rule_message()
+            return
+        except Exception as exc:
+            LOGGER.warning("Unable to save category rule", exc_info=True)
+            QMessageBox.warning(self, "Правило", f"Не удалось сохранить правило.\n\n{exc}")
+            return
         self._selected_rule = rule_id
         self._refresh_rules_table()
         self.refresh_stats()
@@ -966,11 +1019,29 @@ class MainWindow(QMainWindow):
         self._autostart_cb.blockSignals(False)
         QMessageBox.warning(self, "Автозапуск", "Windows не разрешила изменить автозапуск.")
 
+    def _save_close_to_tray(self, checked: bool) -> None:
+        if self._set_setting_best_effort(
+            "close_to_tray",
+            "1" if checked else "0",
+            "close-to-tray preference",
+        ):
+            return
+        self._close_to_tray_cb.blockSignals(True)
+        self._close_to_tray_cb.setChecked(self._setting_value("close_to_tray", "1") == "1")
+        self._close_to_tray_cb.blockSignals(False)
+        QMessageBox.warning(
+            self,
+            "Настройки",
+            "Не удалось сохранить поведение кнопки закрытия.",
+        )
+
     def _save_afk(self) -> None:
         self._db.set_afk_seconds(float(self._afk.value()))
         self._collector.reload_settings()
 
     def _save_collect_window_titles(self, enabled: bool) -> None:
+        if not self._begin_maintenance("Обновление приватности"):
+            return
         try:
             self._db.set_collect_window_titles(enabled)
             self._collector.reload_settings()
@@ -984,9 +1055,14 @@ class MainWindow(QMainWindow):
                 "Конфиденциальность",
                 f"Не удалось полностью применить настройку.\n\n{exc}",
             )
+        finally:
+            self._end_maintenance()
 
     def _save_retention(self) -> None:
+        if not self._begin_maintenance("Очистка старых данных"):
+            return
         days = int(self._retention_combo.currentData() or 0)
+        deleted = 0
         try:
             if not self._collector.flush("retention"):
                 raise RuntimeError("не удалось сохранить текущий интервал")
@@ -996,6 +1072,8 @@ class MainWindow(QMainWindow):
             LOGGER.warning("Unable to apply retention policy", exc_info=True)
             QMessageBox.warning(self, "Срок хранения", str(exc))
             return
+        finally:
+            self._end_maintenance()
         if deleted:
             self.refresh_stats(force_reports=self._stack.currentIndex() == self.PAGE_REPORTS)
 
@@ -1010,11 +1088,15 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        if not self._begin_maintenance("Удаление статистики"):
+            return
         try:
             self._collector.clear_history()
         except Exception as exc:
             QMessageBox.critical(self, "Удаление статистики", str(exc))
             return
+        finally:
+            self._end_maintenance()
         self.refresh_stats(force_reports=self._stack.currentIndex() == self.PAGE_REPORTS)
 
     def _save_excluded(self) -> None:
@@ -1028,7 +1110,7 @@ class MainWindow(QMainWindow):
 
     def _on_theme_changed(self) -> None:
         mode = str(self._theme_combo.currentData() or "system")
-        self._db.set_setting("ui_theme", mode)
+        self._set_setting_best_effort("ui_theme", mode, "UI theme")
         self.theme_changed.emit(mode)
 
     def apply_theme(self, resolved_theme: str) -> None:
@@ -1043,7 +1125,8 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith(".csv"):
             path += ".csv"
         try:
-            self._collector.flush("export")
+            if not self._collector.flush("export"):
+                raise RuntimeError("Не удалось сохранить текущие данные. Экспорт отменён.")
             q_from, q_to = self._period_bounds()
             stats = self._db.period_stats(
                 q_from,
@@ -1052,8 +1135,18 @@ class MainWindow(QMainWindow):
                 include_chart=False,
             )
             export_apps_csv(self._db, q_from, q_to, path, stats)
+        except sqlite3.Error as exc:
+            LOGGER.warning("Unable to read statistics for CSV export", exc_info=True)
+            QMessageBox.warning(
+                self,
+                "Экспорт",
+                f"Не удалось прочитать статистику из базы.\n\n{exc}",
+            )
         except (OSError, RuntimeError) as exc:
             QMessageBox.warning(self, "Экспорт", str(exc))
+        except Exception as exc:
+            LOGGER.warning("Unexpected CSV export failure", exc_info=True)
+            QMessageBox.warning(self, "Экспорт", f"Не удалось создать CSV.\n\n{exc}")
 
     def _reflow_kpis(self, columns: int) -> None:
         if self._kpi_columns == columns:
@@ -1137,14 +1230,73 @@ class MainWindow(QMainWindow):
         if self._refresh_dirty:
             QTimer.singleShot(0, self.refresh_stats)
 
+    def _setting_value(self, key: str, default: str) -> str:
+        try:
+            return self._db.get_setting(key, default) or default
+        except Exception:
+            LOGGER.warning("Unable to read setting %s", key, exc_info=True)
+            return default
+
+    def _set_setting_best_effort(self, key: str, value: str, label: str) -> bool:
+        try:
+            self._db.set_setting(key, value)
+        except Exception:
+            LOGGER.warning("Unable to save %s", label, exc_info=True)
+            return False
+        return True
+
+    def _maintenance_controls(self) -> list[QWidget]:
+        names = (
+            "_collect_window_titles_cb",
+            "_retention_combo",
+            "_delete_history_btn",
+        )
+        return [
+            widget
+            for widget in (getattr(self, name, None) for name in names)
+            if isinstance(widget, QWidget)
+        ]
+
+    def _begin_maintenance(self, status_text: str) -> bool:
+        if self._maintenance_busy:
+            return False
+        self._maintenance_busy = True
+        for widget in self._maintenance_controls():
+            widget.setEnabled(False)
+        self._collector_status.setText(f"●  {status_text}")
+        self._collector_status.setObjectName("statusOk")
+        self._collector_status.setToolTip("")
+        style = self._collector_status.style()
+        style.unpolish(self._collector_status)
+        style.polish(self._collector_status)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._busy_cursor_active = True
+        QApplication.processEvents()
+        return True
+
+    def _end_maintenance(self) -> None:
+        if self._busy_cursor_active:
+            QApplication.restoreOverrideCursor()
+            self._busy_cursor_active = False
+        self._maintenance_busy = False
+        for widget in self._maintenance_controls():
+            widget.setEnabled(True)
+        if self._collector_error_detail:
+            self._set_collector_status(False, self._collector_error_detail)
+        else:
+            self._set_collector_status(True)
+
     def _save_window_state(self) -> None:
-        geometry = base64.b64encode(bytes(self.saveGeometry())).decode("ascii")
-        self._db.set_setting("ui_geometry", geometry)
-        self._db.set_setting("ui_page", str(self._stack.currentIndex()))
-        self._db.set_setting("ui_period", self._current_period)
+        try:
+            geometry = base64.b64encode(bytes(self.saveGeometry())).decode("ascii")
+            self._db.set_setting("ui_geometry", geometry)
+            self._db.set_setting("ui_page", str(self._stack.currentIndex()))
+            self._db.set_setting("ui_period", self._current_period)
+        except Exception:
+            LOGGER.warning("Unable to save window state", exc_info=True)
 
     def _restore_window_state(self) -> None:
-        encoded = self._db.get_setting("ui_geometry", "") or ""
+        encoded = self._setting_value("ui_geometry", "")
         if not encoded:
             return
         try:
@@ -1154,10 +1306,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._save_window_state()
-        close_to_tray = (self._db.get_setting("close_to_tray", "1") or "1") == "1"
+        close_to_tray = self._setting_value("close_to_tray", "1") == "1"
         if self._tray_available and close_to_tray:
-            if (self._db.get_setting("first_close_to_tray_notice_seen", "0") or "0") != "1":
-                self._db.set_setting("first_close_to_tray_notice_seen", "1")
+            if self._setting_value("first_close_to_tray_notice_seen", "0") != "1":
+                self._set_setting_best_effort(
+                    "first_close_to_tray_notice_seen",
+                    "1",
+                    "first close-to-tray notice",
+                )
                 QMessageBox.information(
                     self,
                     "PC Stat",

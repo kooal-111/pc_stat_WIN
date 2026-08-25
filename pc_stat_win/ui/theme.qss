@@ -73,6 +73,13 @@ QFrame#kpiCard {
     padding: 8px;
 }
 
+QFrame#metricBlock {
+    background-color: ${surface_inner};
+    border: 1px solid ${border};
+    border-left: 3px solid ${accent};
+    border-radius: 8px;
+}
+
 QFrame#screenTimeCard,
 QFrame#reportNavigator {
     background-color: ${surface_glass_strong};
@@ -169,10 +176,16 @@ QFrame#reportDivider {
 
 QLabel#statusOk {
     color: ${success};
+    background-color: ${success_bg};
+    border-radius: 6px;
+    padding: 4px 6px;
 }
 
 QLabel#statusError {
     color: ${danger};
+    background-color: ${danger_bg};
+    border-radius: 6px;
+    padding: 4px 6px;
 }
 
 QTabWidget::pane {
@@ -320,6 +333,12 @@ QToolButton[danger="true"] {
     color: ${danger};
 }
 
+QPushButton[danger="true"]:hover,
+QToolButton[danger="true"]:hover {
+    background-color: ${danger_bg};
+    border-color: ${danger};
+}
+
 QPushButton[flatAction="true"] {
     background-color: transparent;
     color: ${accent};
@@ -328,7 +347,7 @@ QPushButton[flatAction="true"] {
 }
 
 QPushButton[flatAction="true"]:hover {
-    background-color: ${selection};
+    background-color: ${accent_soft};
     border-color: transparent;
 }
 
@@ -481,6 +500,11 @@ QTableWidget::item {
     min-height: 36px;
     padding: 4px 8px;
     border: none;
+}
+
+QTableView::item:hover,
+QTableWidget::item:hover {
+    background-color: ${surface_hover};
 }
 
 QTableView::item:selected,

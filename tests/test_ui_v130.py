@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCloseEvent, QColor, QPalette
-from PySide6.QtWidgets import QApplication, QBoxLayout, QMessageBox, QScrollArea
+from PySide6.QtWidgets import QApplication, QBoxLayout, QFileDialog, QMessageBox, QScrollArea
 
 from pc_stat_win.categories import BROWSER
 from pc_stat_win.collector import UsageCollector
@@ -190,6 +191,37 @@ class MainWindowV130Tests(unittest.TestCase):
         self.assertTrue(self.window._rule_up_btn.isEnabled())
         self.assertFalse(self.window._rule_down_btn.isEnabled())
 
+    def test_category_rule_duplicate_uses_database_normalization(self) -> None:
+        self.db.add_category_rule(r"C:\Apps\Product\tool.exe", "path_contains", BROWSER)
+        self.window._refresh_rules_table()
+        self.window._rule_match.setText("c:/apps/product/tool.exe")
+        self.window._rule_kind.setCurrentIndex(self.window._rule_kind.findData("path_contains"))
+        self.window._rule_cat.setCurrentIndex(self.window._rule_cat.findData(BROWSER))
+
+        with patch.object(QMessageBox, "information") as information:
+            self.window._add_category_rule()
+
+        information.assert_called_once()
+        self.assertEqual(len(self.db.list_category_rules()), 1)
+
+    def test_category_rule_save_duplicate_is_reported_without_crash(self) -> None:
+        first = self.db.add_category_rule("first.exe", "exact_basename", BROWSER)
+        second = self.db.add_category_rule("second.exe", "exact_basename", BROWSER)
+        self.window._selected_rule = second
+        self.window._refresh_rules_table()
+        self.window._rules_table.selectRow(0)
+        self.window._rule_match.setText("first.exe")
+        self.window._rule_kind.setCurrentIndex(self.window._rule_kind.findData("exact_basename"))
+        self.window._rule_cat.setCurrentIndex(self.window._rule_cat.findData(BROWSER))
+
+        with patch.object(QMessageBox, "information") as information:
+            self.window._save_category_rule()
+
+        information.assert_called_once()
+        rows = {int(rule["id"]): str(rule["match_text"]) for rule in self.db.list_category_rules()}
+        self.assertEqual(rows[first], "first.exe")
+        self.assertEqual(rows[second], "second.exe")
+
     def test_report_page_rebuilds_chart_once(self) -> None:
         self.window._last_stats = make_stats(4)
         self.window._refresh_dirty = False
@@ -264,6 +296,55 @@ class MainWindowV130Tests(unittest.TestCase):
         self.window._tray_available = False
         self.window.closeEvent(QCloseEvent())
         self.assertEqual(quit_requests, [True])
+
+    def test_close_event_accepts_when_window_state_cannot_be_saved(self) -> None:
+        self.window._tray_available = True
+        self.db.set_setting("close_to_tray", "0")
+        quit_requests: list[bool] = []
+        self.window.quit_requested.connect(lambda: quit_requests.append(True))
+
+        with patch.object(
+            self.db,
+            "set_setting",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch("pc_stat_win.ui.main_window.LOGGER.warning"):
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+
+        self.assertTrue(event.isAccepted())
+        self.assertEqual(quit_requests, [True])
+
+    def test_export_is_cancelled_when_flush_fails(self) -> None:
+        target = Path(self.tmp.name) / "report.csv"
+
+        with (
+            patch.object(QFileDialog, "getSaveFileName", return_value=(str(target), "CSV (*.csv)")),
+            patch.object(self.collector, "flush", return_value=False),
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.window._export_csv()
+
+        warning.assert_called_once()
+        self.assertFalse(target.exists())
+
+    def test_export_database_error_does_not_create_file(self) -> None:
+        target = Path(self.tmp.name) / "report.csv"
+
+        with (
+            patch.object(QFileDialog, "getSaveFileName", return_value=(str(target), "CSV (*.csv)")),
+            patch.object(self.collector, "flush", return_value=True),
+            patch.object(
+                self.db,
+                "period_stats",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+            patch.object(QMessageBox, "warning") as warning,
+            patch("pc_stat_win.ui.main_window.LOGGER.warning"),
+        ):
+            self.window._export_csv()
+
+        warning.assert_called_once()
+        self.assertFalse(target.exists())
 
 
 class ThemeV130Tests(unittest.TestCase):
