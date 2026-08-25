@@ -4,29 +4,45 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import psutil
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QMessageBox, QMenu, QSystemTrayIcon
 
 from pc_stat_win import autostart
-from pc_stat_win.branding import app_icon
-from pc_stat_win.collector import UsageCollector
 from pc_stat_win.config import POLL_INTERVAL_MS, ensure_app_dirs
 from pc_stat_win.db import Database
 from pc_stat_win.formatting import format_duration_seconds
 from pc_stat_win.logging_config import configure_logging
-from pc_stat_win.single_instance import DEFAULT_MUTEX_NAME, DEFAULT_SERVER_NAME, SingleInstance
 from pc_stat_win.version import APP_VERSION
 
 if TYPE_CHECKING:
+    from pc_stat_win.collector import UsageCollector
+    from pc_stat_win.single_instance import SingleInstance
     from pc_stat_win.ui.main_window import MainWindow
     from pc_stat_win.ui.theme_manager import ThemeManager
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _run_packaged_smoke(db_path: os.PathLike[str] | str) -> int:
+    db: Database | None = None
+    try:
+        now = time.time()
+        db = Database(ensure_app_dirs(Path(db_path)))
+        db.log_boot_if_new(now, now)
+        db.touch_boot(now, now)
+        return 0
+    except Exception:
+        LOGGER.exception("Packaged smoke failed")
+        return 1
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                LOGGER.exception("Packaged smoke database shutdown failed")
 
 
 def _argv_without_background_flag() -> list[str]:
@@ -50,12 +66,22 @@ def main() -> int:
     db_path = ensure_app_dirs()
     configure_logging()
     _install_exception_hook()
+    smoke_test = "--smoke-test" in sys.argv
+    if smoke_test:
+        return _run_packaged_smoke(db_path)
+
+    from PySide6.QtCore import QTimer
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import QApplication, QMessageBox, QMenu, QSystemTrayIcon
+
+    from pc_stat_win.branding import app_icon
+    from pc_stat_win.collector import UsageCollector
+    from pc_stat_win.single_instance import DEFAULT_MUTEX_NAME, DEFAULT_SERVER_NAME, SingleInstance
 
     app = QApplication(_argv_without_background_flag())
     app.setApplicationName("PC Stat")
     app.setApplicationDisplayName("PC Stat")
     app.setApplicationVersion(APP_VERSION)
-    smoke_test = "--smoke-test" in sys.argv
 
     window: MainWindow | None = None
     theme_manager: ThemeManager | None = None
@@ -64,7 +90,7 @@ def main() -> int:
     instance: SingleInstance | None = None
     tray: QSystemTrayIcon | None = None
     shutting_down = False
-    tray_available = QSystemTrayIcon.isSystemTrayAvailable() and not smoke_test
+    tray_available = QSystemTrayIcon.isSystemTrayAvailable()
     start_to_tray_only = "--background" in sys.argv
 
     def cleanup() -> None:
@@ -133,11 +159,10 @@ def main() -> int:
         window.raise_()
         window.activateWindow()
 
-    smoke_suffix = f".Smoke.{os.getpid()}" if smoke_test else ""
     try:
         instance = SingleInstance(
-            name=f"{DEFAULT_MUTEX_NAME}{smoke_suffix}",
-            server_name=f"{DEFAULT_SERVER_NAME}{smoke_suffix}",
+            name=DEFAULT_MUTEX_NAME,
+            server_name=DEFAULT_SERVER_NAME,
             on_show=show_window,
         )
     except OSError as exc:
@@ -231,14 +256,11 @@ def main() -> int:
 
         QTimer.singleShot(30_000, optimize_database)
 
-        should_show = smoke_test or (
-            not start_to_tray_only
-            and ((not tray_available) or db.get_show_main_window_on_launch())
+        should_show = not start_to_tray_only and (
+            (not tray_available) or db.get_show_main_window_on_launch()
         )
         if should_show:
             show_window()
-        if smoke_test:
-            QTimer.singleShot(1500, app.quit)
         return int(app.exec())
     except Exception as exc:
         LOGGER.exception("PC Stat startup failed")
